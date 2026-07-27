@@ -295,6 +295,51 @@ To run an existing motion in a visible Blender session without exporting a video
 
 To export MP4 as well, omit `--live-only` and add `--output outputs/api/walk_wave_live.mp4`.
 
+### Persistent Live Blender Session
+
+For USD-scene workflows, keep Blender running and update the same avatar in-place instead of
+restarting Blender for each prompt. [`scripts/blender_live_server.py`](scripts/blender_live_server.py)
+runs inside Blender and exposes a localhost control API. [`scripts/run_live_motion_api.py`](scripts/run_live_motion_api.py)
+keeps ARDY loaded, remembers prior motion history, and sends each generated segment to the existing
+Blender process.
+
+```bash
+# Terminal 1: start Blender once with the live control server.
+~/Projects/blender/blender --python scripts/blender_live_server.py -- --port 9876
+
+# Terminal 2: start the stateful ARDY session API.
+python scripts/run_live_motion_api.py \
+  --blender-url http://127.0.0.1:9876 \
+  --render-mode skin
+
+# Terminal 3: load a USD scene and place the avatar in Blender coordinates.
+python scripts/live_session_client.py load-usd path/to/scene.usd --clear
+python scripts/live_session_client.py place --position 1.0 2.0 0.0 --heading 0.0
+
+# First prompt: plays once and holds on the final frame by default.
+python scripts/live_session_client.py prompt \
+  "Walk in a semicircle and sit down on the floor cross-legged." \
+  --duration 12 \
+  --output semicircle_sit_cross_legged
+
+# Next prompt: continues from the previous end pose/root position.
+python scripts/live_session_client.py prompt \
+  "Stand up and walk toward the doorway." \
+  --duration 8 \
+  --output stand_and_walk
+```
+
+`place --position X Y Z` uses Blender coordinates. `X/Y` become ARDY's ground-plane root
+translation; `Z` is applied as a visual vertical offset in Blender. `--heading 0` faces Blender
+`+Y`. Add `--loop` to a prompt only when you want the segment to loop; without it, playback stops
+on the final frame so the next prompt can resume from that end state.
+
+Optional MP4 export uses the same live Blender process:
+
+```bash
+python scripts/live_session_client.py render-mp4 outputs/live_api/current_take.mp4
+```
+
 Check local tools, CUDA, and Hugging Face access with:
 
 ```bash

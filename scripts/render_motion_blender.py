@@ -23,6 +23,8 @@ SKIN_ASSETS_BY_JOINT_COUNT = {
 }
 ANIMATED_MESHES: list[tuple[bpy.types.Object, np.ndarray]] = []
 LOOP_PLAYBACK = False
+HOLD_END_PLAYBACK = False
+LAST_PLAYBACK_FRAME = 0
 
 
 PARENTS_BY_JOINT_COUNT = {
@@ -451,15 +453,43 @@ def keep_playback_looping() -> float | None:
     return 0.25
 
 
+def hold_playback_at_end() -> float | None:
+    global LAST_PLAYBACK_FRAME
+
+    if not HOLD_END_PLAYBACK:
+        return None
+
+    scene = bpy.context.scene
+    screen = bpy.context.screen
+    current_frame = int(scene.frame_current)
+    wrapped_to_start = LAST_PLAYBACK_FRAME > 0 and current_frame < LAST_PLAYBACK_FRAME
+    if current_frame >= int(scene.frame_end) or wrapped_to_start:
+        if screen is not None and getattr(screen, "is_animation_playing", False):
+            try:
+                bpy.ops.screen.animation_play()
+            except RuntimeError:
+                pass
+        scene.frame_set(scene.frame_end)
+        LAST_PLAYBACK_FRAME = int(scene.frame_end)
+        return None
+
+    LAST_PLAYBACK_FRAME = current_frame
+    return 0.05
+
+
 def start_timeline_playback(loop: bool = False) -> None:
-    global LOOP_PLAYBACK
+    global HOLD_END_PLAYBACK, LAST_PLAYBACK_FRAME, LOOP_PLAYBACK
 
     scene = bpy.context.scene
     scene.frame_set(scene.frame_start)
     LOOP_PLAYBACK = loop
+    HOLD_END_PLAYBACK = not loop
+    LAST_PLAYBACK_FRAME = int(scene.frame_start)
 
     if loop and not bpy.app.timers.is_registered(keep_playback_looping):
         bpy.app.timers.register(keep_playback_looping, first_interval=0.25)
+    if not loop and not bpy.app.timers.is_registered(hold_playback_at_end):
+        bpy.app.timers.register(hold_playback_at_end, first_interval=0.05)
 
     if bpy.context.screen is None:
         print("No Blender screen is available; skipping live playback.", flush=True)
@@ -469,6 +499,19 @@ def start_timeline_playback(loop: bool = False) -> None:
         bpy.ops.screen.animation_play()
     except RuntimeError as error:
         print(f"Could not start Blender timeline playback: {error}", flush=True)
+
+
+def stop_timeline_playback() -> None:
+    global HOLD_END_PLAYBACK, LOOP_PLAYBACK
+
+    LOOP_PLAYBACK = False
+    HOLD_END_PLAYBACK = False
+    screen = bpy.context.screen
+    if screen is not None and getattr(screen, "is_animation_playing", False):
+        try:
+            bpy.ops.screen.animation_play()
+        except RuntimeError:
+            pass
 
 
 def resolve_render_mode(requested_mode: str, motion: MotionData, skin: SkinData | None) -> str:
