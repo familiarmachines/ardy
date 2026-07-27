@@ -255,6 +255,64 @@ Most useful flags:
 
 > Tip: if you generate repeatedly, start the standalone text-encoder service in the background first (`python scripts/run_text_encoder_server.py`) so each run connects to it instead of loading the LLM2Vec model in-process every time.
 
+### HTTP API + Blender Rendering
+
+For repeated Codex-driven generation, [`scripts/run_motion_api.py`](scripts/run_motion_api.py) keeps an
+ARDY model loaded behind a small JSON API. It can optionally call Blender through
+[`scripts/render_motion_blender.py`](scripts/render_motion_blender.py) and return both `.npz` and `.mp4`
+paths. Blender rendering defaults to `--render-mode auto`, which uses the packaged skinned human mesh
+when the motion file contains compatible joint rotations and falls back to a skeleton otherwise.
+
+```bash
+# Terminal 1: start the long-running API.
+python scripts/run_motion_api.py --render-by-default
+
+# Terminal 2: submit a prompt and render it in Blender.
+python scripts/request_motion.py \
+  "A person walks forward, turns left, then waves with their right hand." \
+  --duration 6 \
+  --seed 42 \
+  --render \
+  --render-mode skin \
+  --output walk_wave
+```
+
+The API listens on `http://127.0.0.1:8765` by default. The request above writes
+`outputs/api/walk_wave.npz` and `outputs/api/walk_wave.mp4`.
+
+To run an existing motion in a visible Blender session without exporting a video, omit
+`--background` and use `--live-only --play`:
+
+```bash
+~/Projects/blender/blender --python scripts/render_motion_blender.py -- \
+  outputs/api/walk_wave.npz \
+  --render-mode skin \
+  --live-only \
+  --play \
+  --loop \
+  --save-blend outputs/api/walk_wave_live.blend
+```
+
+To export MP4 as well, omit `--live-only` and add `--output outputs/api/walk_wave_live.mp4`.
+
+Check local tools, CUDA, and Hugging Face access with:
+
+```bash
+curl http://127.0.0.1:8765/diagnostics
+```
+
+The same Hugging Face token requirements from setup apply: prompt generation needs access to the
+gated Meta Llama text encoder unless you run a compatible text-encoder service and start the API
+with `--text-encoder-mode api --text-encoder-url ...`.
+
+Equivalent raw HTTP request:
+
+```bash
+curl -X POST http://127.0.0.1:8765/generate \
+  -H 'Content-Type: application/json' \
+  -d '{"prompt":"A person jumps backwards.","duration":4,"render":true}'
+```
+
 ---
 
 ## Related Humanoid Work at NVIDIA
