@@ -51,6 +51,32 @@ def parse_args() -> argparse.Namespace:
     prompt.add_argument("--no-auto-camera", action="store_true")
     prompt.add_argument("--save-blend", default=None, help="Optional .blend path saved by Blender after loading.")
     prompt.add_argument("--render-mp4", default=None, help="Optional MP4 export path rendered by live Blender.")
+    prompt.add_argument(
+        "--waypoint",
+        type=float,
+        nargs="+",
+        action="append",
+        default=None,
+        metavar="VALUE",
+        help=(
+            "Waypoint in Blender ground-plane coordinates. Use X Y for auto-spaced "
+            "waypoints, FRAME X Y for explicit frame targets, or FRAME X Y HEADING; repeatable."
+        ),
+    )
+    prompt.add_argument(
+        "--waypoint-time",
+        type=float,
+        nargs=3,
+        action="append",
+        default=None,
+        metavar=("SECONDS", "X", "Y"),
+        help="Waypoint specified by time in seconds plus Blender ground-plane X Y; repeatable.",
+    )
+    prompt.add_argument(
+        "--waypoints-json",
+        default=None,
+        help="Raw JSON waypoint list to send to the live API.",
+    )
 
     reset = subparsers.add_parser("reset", help="Clear ARDY motion history.")
     reset.add_argument("--clear-blender", action="store_true", help="Also remove the live avatar from Blender.")
@@ -75,6 +101,36 @@ def request_json(method: str, url: str, payload: dict[str, Any] | None = None, t
     except urllib.error.HTTPError as error:
         sys.stderr.write(error.read().decode("utf-8") + "\n")
         raise SystemExit(error.code)
+
+
+def build_waypoints(args: argparse.Namespace) -> list[Any] | None:
+    waypoints: list[Any] = []
+
+    if args.waypoints_json:
+        try:
+            raw_waypoints = json.loads(args.waypoints_json)
+        except json.JSONDecodeError as error:
+            raise SystemExit(f"--waypoints-json is not valid JSON: {error}") from error
+        if not isinstance(raw_waypoints, list):
+            raise SystemExit("--waypoints-json must decode to a JSON list.")
+        waypoints.extend(raw_waypoints)
+
+    for waypoint in args.waypoint or []:
+        if len(waypoint) == 2:
+            waypoints.append([float(waypoint[0]), float(waypoint[1])])
+        elif len(waypoint) == 3:
+            waypoints.append([int(round(waypoint[0])), float(waypoint[1]), float(waypoint[2])])
+        elif len(waypoint) == 4:
+            waypoints.append(
+                [int(round(waypoint[0])), float(waypoint[1]), float(waypoint[2]), float(waypoint[3])]
+            )
+        else:
+            raise SystemExit("--waypoint expects X Y, FRAME X Y, or FRAME X Y HEADING.")
+
+    for seconds, x_pos, y_pos in args.waypoint_time or []:
+        waypoints.append({"time": float(seconds), "position": [float(x_pos), float(y_pos)]})
+
+    return waypoints or None
 
 
 def main() -> None:
@@ -127,6 +183,9 @@ def main() -> None:
             value = getattr(args, key)
             if value is not None:
                 payload[key] = value
+        waypoints = build_waypoints(args)
+        if waypoints is not None:
+            payload["waypoints"] = waypoints
         result = request_json("POST", f"{base_url}/prompt", payload)
     elif args.command == "reset":
         result = request_json("POST", f"{base_url}/reset", {"clear_blender": args.clear_blender})

@@ -327,12 +327,42 @@ python scripts/live_session_client.py prompt \
   "Stand up and walk toward the doorway." \
   --duration 8 \
   --output stand_and_walk
+
+# Waypoint prompt: root follows Blender ground-plane X/Y targets at given frames.
+python scripts/live_session_client.py prompt \
+  "Walk naturally along the marked route." \
+  --duration 6 \
+  --cfg-weight 2.0 2.0 \
+  --waypoint 40 0.6 0.3 \
+  --waypoint 80 0.2 0.1 \
+  --waypoint 119 0.0 0.0 \
+  --show-root-path \
+  --output waypoint_walk
 ```
 
 `place --position X Y Z` uses Blender coordinates. `X/Y` become ARDY's ground-plane root
 translation; `Z` is applied as a visual vertical offset in Blender. `--heading 0` faces Blender
 `+Y`. Add `--loop` to a prompt only when you want the segment to loop; without it, playback stops
 on the final frame so the next prompt can resume from that end state.
+
+Waypoints use the same Blender ground-plane coordinates as placement: `--waypoint FRAME X Y`
+sets an explicit root target, `--waypoint X Y` auto-spaces targets across the requested duration,
+and `--waypoint-time SECONDS X Y` targets a timestamp. The live API response includes the parsed
+`waypoints` plus `waypoint_errors` for the generated root positions. Raw HTTP clients can send the
+same data as JSON:
+
+```json
+{
+  "prompt": "Walk naturally along the marked route.",
+  "duration": 6,
+  "cfg_weight": [2.0, 2.0],
+  "waypoints": [
+    {"frame": 40, "position": [0.6, 0.3]},
+    {"time": 4.0, "position": [0.2, 0.1]},
+    [119, 0.0, 0.0]
+  ]
+}
+```
 
 Optional MP4 export uses the same live Blender process:
 
@@ -343,7 +373,7 @@ python scripts/live_session_client.py render-mp4 outputs/live_api/current_take.m
 Check local tools, CUDA, and Hugging Face access with:
 
 ```bash
-curl http://127.0.0.1:8765/diagnostics
+curl http://127.0.0.1:8766/diagnostics
 ```
 
 The same Hugging Face token requirements from setup apply: prompt generation needs access to the

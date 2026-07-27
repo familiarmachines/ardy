@@ -21,8 +21,8 @@ from urllib.parse import urljoin, urlparse
 import numpy as np
 import torch
 
+from ardy.constraints import Root2DConstraintSet
 from ardy.model import DEFAULT_MODEL
-from ardy.model.ardy_model import translate_normalized_root_motion
 from ardy.model.loading import get_env_var
 from ardy.skeleton import SOMASkeleton30
 from ardy.tools import seed_everything, to_numpy
@@ -32,7 +32,6 @@ from run_motion_api import (  # noqa: E402
     MotionGenerator,
     SetupError,
     default_device,
-    default_history_frames,
     humanize_setup_error,
     parse_cfg_weight,
     resolve_blender,
@@ -120,6 +119,17 @@ def blender_position_to_ardy_translation(position: list[float]) -> torch.Tensor:
     return torch.tensor([[float(position[0]), 0.0, float(position[1])]], dtype=torch.float32)
 
 
+def blender_ground_to_ardy_root_2d(position: list[float] | tuple[float, ...]) -> list[float]:
+    if len(position) < 2:
+        raise ValueError("Waypoint position must contain at least [x, y] in Blender ground-plane coordinates.")
+    return [float(position[0]), float(position[1])]
+
+
+def ardy_root_2d_to_blender_ground(position: torch.Tensor | np.ndarray | list[float]) -> list[float]:
+    values = position.detach().cpu().numpy() if isinstance(position, torch.Tensor) else np.asarray(position)
+    return [float(values[0]), float(values[1])]
+
+
 class LiveMotionSession:
     def __init__(self, config: LiveAPIConfig):
         self.config = config
@@ -148,6 +158,7 @@ class LiveMotionSession:
         self.max_stored_frames = 4000
         self.last_prompt: str | None = None
         self.last_motion_path: str | None = None
+        self.last_waypoints: list[dict[str, Any]] = []
 
     def preload(self) -> None:
         self.generator.preload()
@@ -166,6 +177,7 @@ class LiveMotionSession:
             "init_heading": self.init_heading,
             "last_prompt": self.last_prompt,
             "last_motion_path": self.last_motion_path,
+            "last_waypoints": self.last_waypoints,
         }
 
     def diagnostics(self) -> dict[str, Any]:
@@ -216,6 +228,7 @@ class LiveMotionSession:
             self.segment_index = 0
             self.last_prompt = None
             self.last_motion_path = None
+            self.last_waypoints = []
             blender = None
             if bool(payload.get("clear_blender", False)):
                 blender = self._post_blender("/avatar/clear", {}, timeout=30.0)
@@ -244,6 +257,7 @@ class LiveMotionSession:
             continue_from_history = bool(payload.get("continue", True))
             history_frames = self.generator._resolve_history_frames(model, payload.get("history_frames"))
             text_feat, text_pad_mask = model._encode_text([prompt])
+            waypoints = self._parse_waypoints(payload.get("waypoints"), requested_new_frames, fps)
 
             previous_end_motion = (
                 self.motion_tensor[:, -1:].detach().clone()
@@ -261,6 +275,7 @@ class LiveMotionSession:
                 cfg_weight=cfg_weight,
                 history_frames=history_frames,
                 continue_from_history=continue_from_history,
+                waypoints=waypoints,
             )
 
             if previous_end_motion is not None:
@@ -312,9 +327,23 @@ class LiveMotionSession:
                 visible_root = visible_output["root_positions"][0, 0].detach().cpu().numpy()
                 continuity_delta = float(np.linalg.norm(visible_root - prev_root))
 
+            waypoint_errors = self._measure_waypoint_errors(
+                visible_output=visible_output,
+                waypoints=waypoints,
+                visible_frame_offset=1 if previous_end_motion is not None else 0,
+            )
+
             self.segment_index += 1
             self.last_prompt = prompt
             self.last_motion_path = str(motion_path)
+            self.last_waypoints = [
+                {
+                    "frame": waypoint["frame"],
+                    "position": waypoint["position"],
+                    **({"heading": waypoint["heading"]} if waypoint.get("heading") is not None else {}),
+                }
+                for waypoint in waypoints
+            ]
 
             return {
                 "status": "ok",
@@ -326,6 +355,8 @@ class LiveMotionSession:
                 "history_frames": int(self.motion_tensor.shape[1]) if self.motion_tensor is not None else 0,
                 "history_used": bool(previous_end_motion is not None),
                 "continuity_root_delta": continuity_delta,
+                "waypoints": self.last_waypoints,
+                "waypoint_errors": waypoint_errors,
                 "motion_path": str(motion_path),
                 "blender": blender,
                 "render_mp4": render_response,
@@ -353,6 +384,7 @@ class LiveMotionSession:
         cfg_weight: float | tuple[float, float],
         history_frames: int,
         continue_from_history: bool,
+        waypoints: list[dict[str, Any]],
     ) -> list[torch.Tensor]:
         remaining = requested_new_frames
         gen_horizon_len = int(model.gen_horizon_len)
@@ -360,17 +392,26 @@ class LiveMotionSession:
         init_translation = blender_position_to_ardy_translation(self.avatar_position_blender).to(self.config.device)
         init_heading = torch.tensor([self.init_heading], dtype=torch.float32, device=self.config.device)
         new_windows: list[torch.Tensor] = []
+        generated_so_far = 0
 
         while remaining > 0:
             history_tail = self._history_tail(model, history_frames) if continue_from_history else None
             if history_tail is not None:
                 history_len = int(history_tail.shape[1])
                 total_frames = history_len + gen_horizon_len
+                motion_mask, observed_motion = self._build_waypoint_conditions_for_window(
+                    model=model,
+                    waypoints=waypoints,
+                    segment_start_frame=generated_so_far,
+                    window_new_frames=gen_horizon_len,
+                    history_len=history_len,
+                    total_frames=total_frames,
+                )
                 generated = model.autoregressive_step(
                     num_frames=total_frames,
                     num_denoising_steps=diffusion_steps,
-                    motion_mask=None,
-                    observed_motion=None,
+                    motion_mask=motion_mask,
+                    observed_motion=observed_motion,
                     cfg_weight=cfg_weight,
                     text_feat=text_feat,
                     text_pad_mask=text_pad_mask,
@@ -381,11 +422,19 @@ class LiveMotionSession:
                 new_window = generated[:, history_len:]
             else:
                 total_frames = math.ceil(gen_horizon_len / num_frames_per_token) * num_frames_per_token
+                motion_mask, observed_motion = self._build_waypoint_conditions_for_window(
+                    model=model,
+                    waypoints=waypoints,
+                    segment_start_frame=generated_so_far,
+                    window_new_frames=gen_horizon_len,
+                    history_len=0,
+                    total_frames=total_frames,
+                )
                 generated = model.autoregressive_step(
                     num_frames=total_frames,
                     num_denoising_steps=diffusion_steps,
-                    motion_mask=None,
-                    observed_motion=None,
+                    motion_mask=motion_mask,
+                    observed_motion=observed_motion,
                     cfg_weight=cfg_weight,
                     text_feat=text_feat,
                     text_pad_mask=text_pad_mask,
@@ -407,10 +456,160 @@ class LiveMotionSession:
 
             new_windows.append(taken)
             remaining -= take
+            generated_so_far += take
 
         if not new_windows:
             raise RuntimeError(f"No motion frames were generated for prompt: {prompt}")
         return new_windows
+
+    def _parse_waypoints(self, raw_waypoints: Any, requested_new_frames: int, fps: float) -> list[dict[str, Any]]:
+        if raw_waypoints is None:
+            return []
+        if not isinstance(raw_waypoints, list):
+            raise ValueError("waypoints must be a JSON list.")
+
+        parsed: list[dict[str, Any]] = []
+        auto_frame_items: list[tuple[int, Any]] = []
+        for index, item in enumerate(raw_waypoints):
+            frame: int | None = None
+            heading: float | None = None
+            position: Any
+
+            if isinstance(item, dict):
+                position = item.get("position")
+                if position is None:
+                    if "x" in item and "y" in item:
+                        position = [item["x"], item["y"]]
+                    else:
+                        raise ValueError(f"Waypoint {index} must include position or x/y.")
+                if item.get("frame") is not None:
+                    frame = int(item["frame"])
+                elif item.get("time") is not None:
+                    frame = int(round(float(item["time"]) * fps))
+                if item.get("heading") is not None:
+                    heading = float(item["heading"])
+            elif isinstance(item, list):
+                if len(item) == 2:
+                    position = item
+                elif len(item) == 3:
+                    frame = int(item[0])
+                    position = item[1:]
+                elif len(item) == 4:
+                    frame = int(item[0])
+                    position = item[1:3]
+                    heading = float(item[3])
+                else:
+                    raise ValueError(
+                        "List waypoints must be [x, y], [frame, x, y], or [frame, x, y, heading]."
+                    )
+            else:
+                raise ValueError(f"Unsupported waypoint {index}: expected object or list.")
+
+            parsed_item = {
+                "frame": frame,
+                "position": blender_ground_to_ardy_root_2d(position),
+                "heading": heading,
+            }
+            if frame is None:
+                auto_frame_items.append((len(parsed), parsed_item))
+            parsed.append(parsed_item)
+
+        if auto_frame_items:
+            count = len(auto_frame_items)
+            for auto_idx, (parsed_idx, item) in enumerate(auto_frame_items, start=1):
+                frame = int(round(auto_idx * requested_new_frames / count))
+                item["frame"] = max(0, min(requested_new_frames - 1, frame))
+                parsed[parsed_idx] = item
+
+        normalized = []
+        for waypoint in parsed:
+            frame = int(waypoint["frame"])
+            if not 0 <= frame < requested_new_frames:
+                raise ValueError(
+                    f"Waypoint frame {frame} is outside generated range [0, {requested_new_frames - 1}]."
+                )
+            normalized.append(
+                {
+                    "frame": frame,
+                    "position": [float(waypoint["position"][0]), float(waypoint["position"][1])],
+                    "heading": waypoint.get("heading"),
+                }
+            )
+
+        normalized.sort(key=lambda waypoint: waypoint["frame"])
+        return normalized
+
+    def _build_waypoint_conditions_for_window(
+        self,
+        model,
+        waypoints: list[dict[str, Any]],
+        segment_start_frame: int,
+        window_new_frames: int,
+        history_len: int,
+        total_frames: int,
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+        window_waypoints = [
+            waypoint
+            for waypoint in waypoints
+            if segment_start_frame <= int(waypoint["frame"]) < segment_start_frame + window_new_frames
+        ]
+        if not window_waypoints:
+            return None, None
+
+        frame_indices = torch.tensor(
+            [history_len + int(waypoint["frame"]) - segment_start_frame for waypoint in window_waypoints],
+            device=self.config.device,
+            dtype=torch.long,
+        )
+        root_2d = torch.tensor(
+            [waypoint["position"] for waypoint in window_waypoints],
+            device=self.config.device,
+            dtype=torch.float32,
+        )
+        headings = (
+            torch.tensor(
+                [float(waypoint["heading"]) for waypoint in window_waypoints],
+                device=self.config.device,
+                dtype=torch.float32,
+            )
+            if all(waypoint.get("heading") is not None for waypoint in window_waypoints)
+            else None
+        )
+        constraints = [Root2DConstraintSet(model.skeleton, frame_indices, root_2d, global_root_heading=headings)]
+        observed_motion, motion_mask = model.motion_rep.create_conditions_from_constraints(
+            constraints,
+            length=total_frames,
+            to_normalize=True,
+            device=self.config.device,
+        )
+        return motion_mask.unsqueeze(0), observed_motion.unsqueeze(0)
+
+    def _measure_waypoint_errors(
+        self,
+        visible_output: dict[str, torch.Tensor],
+        waypoints: list[dict[str, Any]],
+        visible_frame_offset: int,
+    ) -> list[dict[str, Any]]:
+        if not waypoints:
+            return []
+
+        root_positions = visible_output["root_positions"][0]
+        errors = []
+        for waypoint in waypoints:
+            visible_frame = min(int(waypoint["frame"]) + visible_frame_offset, int(root_positions.shape[0]) - 1)
+            actual_2d = root_positions[visible_frame, [0, 2]]
+            target_2d = torch.tensor(waypoint["position"], device=actual_2d.device, dtype=actual_2d.dtype)
+            error = torch.linalg.norm(actual_2d - target_2d).item()
+            errors.append(
+                {
+                    "frame": int(waypoint["frame"]),
+                    "visible_frame": visible_frame,
+                    "target": waypoint["position"],
+                    "actual": ardy_root_2d_to_blender_ground(actual_2d),
+                    "error": float(error),
+                }
+            )
+        return errors
 
 
 class LiveMotionHandler(BaseHTTPRequestHandler):
