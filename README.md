@@ -307,6 +307,10 @@ Blender process.
 # Terminal 1: start Blender once with the live control server.
 ~/Projects/blender/blender --python scripts/blender_live_server.py -- --port 9876
 
+# Optional scene4 dev startup: starts Blender with the textured USD wrapper, dimmed scene lights,
+# Rendered viewport shading, and the default avatar marker.
+scripts/start_scene4_live_blender.sh
+
 # Terminal 2: start the stateful ARDY session API.
 python scripts/run_live_motion_api.py \
   --blender-url http://127.0.0.1:9876 \
@@ -340,16 +344,75 @@ python scripts/live_session_client.py prompt \
   --output waypoint_walk
 ```
 
+The scene4 launcher expects the local scene asset at `scene4/scene4/main.usd`. On first run it creates
+`outputs/live_api/scene4_textured.usda`, a lightweight wrapper layer that converts scene4's custom
+texture inputs into Blender-readable `UsdPreviewSurface` material networks. The source `scene4/`
+asset folder is intentionally ignored by git because it is large.
+
+Equivalent manual startup:
+
+```bash
+~/Projects/blender/blender --python scripts/blender_live_server.py -- \
+  --port 9876 \
+  --width 640 \
+  --height 360 \
+  --usd outputs/live_api/scene4_textured.usda \
+  --light-intensity-scale 0.0001 \
+  --max-light-energy 600 \
+  --exposure 0.0 \
+  --gamma 1.0 \
+  --view-transform AgX \
+  --world-color 0.02 0.02 0.02 \
+  --viewport-shading RENDERED \
+  --use-scene-lights \
+  --use-scene-world \
+  --avatar-position 0.5 0.25 0.0 \
+  --avatar-heading 0.0
+```
+
 `place --position X Y Z` uses Blender coordinates. `X/Y` become ARDY's ground-plane root
 translation; `Z` is applied as a visual vertical offset in Blender. `--heading 0` faces Blender
 `+Y`. Add `--loop` to a prompt only when you want the segment to loop; without it, playback stops
 on the final frame so the next prompt can resume from that end state.
 
-Waypoints use the same Blender ground-plane coordinates as placement: `--waypoint FRAME X Y`
-sets an explicit root target, `--waypoint X Y` auto-spaces targets across the requested duration,
-and `--waypoint-time SECONDS X Y` targets a timestamp. The live API response includes the parsed
-`waypoints` plus `waypoint_errors` for the generated root positions. Raw HTTP clients can send the
-same data as JSON:
+Waypoints use the same Blender ground-plane coordinates as placement. You can still pass explicit
+targets on each prompt: `--waypoint FRAME X Y` sets a root target, `--waypoint X Y` auto-spaces
+targets across the requested duration, and `--waypoint-time SECONDS X Y` targets a timestamp.
+
+For scene layout work, you can also place waypoints from Blender's 3D cursor:
+
+```bash
+# In Blender: select the 3D Cursor tool, then left-click a floor point.
+python scripts/live_session_client.py add-waypoint
+
+# Repeat cursor placement and add-waypoint for each floor point. The server adds WP<N>
+# markers and a connecting route curve in the live Blender scene.
+python scripts/live_session_client.py waypoints
+
+# If no explicit --waypoint values are supplied, prompt generation uses the stored Blender markers.
+python scripts/live_session_client.py prompt \
+  "Walk naturally along the marked route." \
+  --duration 6 \
+  --cfg-weight 2.0 2.0 \
+  --show-root-path \
+  --output cursor_waypoint_walk
+```
+
+Typed marker placement uses the same waypoint store:
+
+```bash
+python scripts/live_session_client.py add-waypoint --position 0.6 0.3 --frame 40
+python scripts/live_session_client.py add-waypoint --position 0.2 0.1 --frame 80
+python scripts/live_session_client.py add-waypoint --position 0.0 0.0 --frame 119
+python scripts/live_session_client.py remove-last-waypoint
+python scripts/live_session_client.py clear-waypoints
+```
+
+Stored waypoint marker positions keep Blender `(X, Y, Z)` for display, but ARDY uses only the
+ground-plane `(X, Y)` values as root constraints. Add `--no-stored-waypoints` to a prompt to ignore
+the live Blender marker list. The live API response includes the parsed `waypoints`, the
+`waypoint_source`, and `waypoint_errors` for the generated root positions. Raw HTTP clients can send
+the same data as JSON:
 
 ```json
 {

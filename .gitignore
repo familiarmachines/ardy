@@ -19,6 +19,7 @@ __pycache__/
 *.so
 
 datasets
+/scene4/
 
 # Distribution / packaging
 .Python

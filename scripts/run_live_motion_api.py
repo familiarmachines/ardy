@@ -196,8 +196,32 @@ class LiveMotionSession:
     def _post_blender(self, route: str, payload: dict[str, Any], timeout: float = 600.0) -> dict[str, Any]:
         return post_json(urljoin(self.config.blender_url + "/", route.lstrip("/")), payload, timeout=timeout)
 
+    def _get_blender(self, route: str, timeout: float = 10.0) -> dict[str, Any]:
+        return get_json(urljoin(self.config.blender_url + "/", route.lstrip("/")), timeout=timeout)
+
     def load_usd(self, payload: dict[str, Any]) -> dict[str, Any]:
         return self._post_blender("/scene/load_usd", payload, timeout=float(payload.get("timeout", 120.0)))
+
+    def configure_lighting(self, payload: dict[str, Any]) -> dict[str, Any]:
+        return self._post_blender("/scene/lighting", payload, timeout=float(payload.get("timeout", 30.0)))
+
+    def set_viewport_shading(self, payload: dict[str, Any]) -> dict[str, Any]:
+        return self._post_blender("/viewport/shading", payload, timeout=float(payload.get("timeout", 30.0)))
+
+    def list_waypoints(self) -> dict[str, Any]:
+        return self._get_blender("/waypoints", timeout=10.0)
+
+    def add_waypoint(self, payload: dict[str, Any]) -> dict[str, Any]:
+        return self._post_blender("/waypoints/add", payload, timeout=float(payload.get("timeout", 30.0)))
+
+    def add_waypoint_from_cursor(self, payload: dict[str, Any]) -> dict[str, Any]:
+        return self._post_blender("/waypoints/add_from_cursor", payload, timeout=float(payload.get("timeout", 30.0)))
+
+    def clear_waypoints(self, payload: dict[str, Any]) -> dict[str, Any]:
+        return self._post_blender("/waypoints/clear", payload, timeout=float(payload.get("timeout", 30.0)))
+
+    def remove_last_waypoint(self, payload: dict[str, Any]) -> dict[str, Any]:
+        return self._post_blender("/waypoints/remove_last", payload, timeout=float(payload.get("timeout", 30.0)))
 
     def place_avatar(self, payload: dict[str, Any]) -> dict[str, Any]:
         position = payload.get("position", self.avatar_position_blender)
@@ -234,6 +258,33 @@ class LiveMotionSession:
                 blender = self._post_blender("/avatar/clear", {}, timeout=30.0)
             return {"status": "ok", "history_frames": 0, "blender": blender}
 
+    def _waypoints_for_generation(self, waypoints: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        generation_waypoints = []
+        for waypoint in waypoints:
+            generation_waypoint: dict[str, Any] = {"position": waypoint["position"]}
+            for key in ("frame", "time", "heading"):
+                if waypoint.get(key) is not None:
+                    generation_waypoint[key] = waypoint[key]
+            generation_waypoints.append(generation_waypoint)
+        return generation_waypoints
+
+    def _resolve_prompt_waypoints(self, payload: dict[str, Any]) -> tuple[Any, str, str | None]:
+        raw_waypoints = payload.get("waypoints")
+        if raw_waypoints is not None:
+            return raw_waypoints, "request", None
+        if not bool(payload.get("use_stored_waypoints", True)):
+            return None, "disabled", None
+
+        try:
+            response = self.list_waypoints()
+        except Exception as error:
+            return None, "unavailable", str(error)
+
+        stored_waypoints = response.get("waypoints", [])
+        if not stored_waypoints:
+            return None, "none", None
+        return self._waypoints_for_generation(stored_waypoints), "stored", None
+
     def prompt(self, payload: dict[str, Any]) -> dict[str, Any]:
         prompt = str(payload.get("prompt", "")).strip()
         if not prompt:
@@ -257,7 +308,8 @@ class LiveMotionSession:
             continue_from_history = bool(payload.get("continue", True))
             history_frames = self.generator._resolve_history_frames(model, payload.get("history_frames"))
             text_feat, text_pad_mask = model._encode_text([prompt])
-            waypoints = self._parse_waypoints(payload.get("waypoints"), requested_new_frames, fps)
+            raw_waypoints, waypoint_source, waypoint_source_error = self._resolve_prompt_waypoints(payload)
+            waypoints = self._parse_waypoints(raw_waypoints, requested_new_frames, fps)
 
             previous_end_motion = (
                 self.motion_tensor[:, -1:].detach().clone()
@@ -355,6 +407,8 @@ class LiveMotionSession:
                 "history_frames": int(self.motion_tensor.shape[1]) if self.motion_tensor is not None else 0,
                 "history_used": bool(previous_end_motion is not None),
                 "continuity_root_delta": continuity_delta,
+                "waypoint_source": waypoint_source,
+                "waypoint_source_error": waypoint_source_error,
                 "waypoints": self.last_waypoints,
                 "waypoint_errors": waypoint_errors,
                 "motion_path": str(motion_path),
@@ -626,6 +680,9 @@ class LiveMotionHandler(BaseHTTPRequestHandler):
         if route == "/diagnostics":
             self._send_json(self.server.session.diagnostics())
             return
+        if route == "/waypoints":
+            self._send_json(self.server.session.list_waypoints())
+            return
         self._send_json({"status": "error", "error": f"Unknown route {route}"}, status=404)
 
     def do_POST(self) -> None:
@@ -634,8 +691,20 @@ class LiveMotionHandler(BaseHTTPRequestHandler):
             payload = self._read_json()
             if route == "/scene/load_usd":
                 response = self.server.session.load_usd(payload)
+            elif route == "/scene/lighting":
+                response = self.server.session.configure_lighting(payload)
+            elif route == "/viewport/shading":
+                response = self.server.session.set_viewport_shading(payload)
             elif route == "/avatar/place":
                 response = self.server.session.place_avatar(payload)
+            elif route == "/waypoints/add":
+                response = self.server.session.add_waypoint(payload)
+            elif route == "/waypoints/add_from_cursor":
+                response = self.server.session.add_waypoint_from_cursor(payload)
+            elif route == "/waypoints/clear":
+                response = self.server.session.clear_waypoints(payload)
+            elif route == "/waypoints/remove_last":
+                response = self.server.session.remove_last_waypoint(payload)
             elif route == "/prompt":
                 response = self.server.session.prompt(payload)
             elif route == "/reset":
