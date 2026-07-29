@@ -92,7 +92,12 @@ def parse_args() -> argparse.Namespace:
     prompt.add_argument("--no-play", action="store_true", help="Load the motion but do not start playback.")
     prompt.add_argument("--loop", action="store_true", help="Loop this segment in Blender.")
     prompt.add_argument("--show-root-path", action="store_true")
-    prompt.add_argument("--no-auto-camera", action="store_true")
+    prompt.add_argument(
+        "--auto-camera",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Replace the active scene camera with automatic motion framing.",
+    )
     prompt.add_argument(
         "--no-stored-waypoints",
         action="store_true",
@@ -257,7 +262,7 @@ def main() -> None:
             "play": not args.no_play,
             "loop": args.loop,
             "show_root_path": args.show_root_path,
-            "auto_camera": not args.no_auto_camera,
+            "auto_camera": args.auto_camera,
             "use_stored_waypoints": not args.no_stored_waypoints,
         }
         for key in (

@@ -16,6 +16,7 @@ from typing import Any, Callable
 from urllib.parse import urlparse
 
 import bpy
+import gpu
 import numpy as np
 from mathutils import Vector
 
@@ -40,6 +41,7 @@ from render_motion_blender import (  # noqa: E402
     setup_world,
     start_timeline_playback,
     stop_timeline_playback,
+    to_blender_points,
     update_ardy_animated_meshes,
 )
 
@@ -48,6 +50,7 @@ DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 9876
 AVATAR_OBJECT_PROP = "ardy_live_avatar_object"
 CAMERA_OBJECT_PROP = "ardy_live_camera_object"
+DEFAULT_CAMERA_PROP = "ardy_default_camera_object"
 WAYPOINT_OBJECT_PROP = "ardy_live_waypoint_object"
 START_MARKER_NAME = "ardy_avatar_start"
 ORIGINAL_LIGHT_ENERGY_PROP = "ardy_original_light_energy"
@@ -111,6 +114,27 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--use-scene-lights", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--use-scene-world", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument("--viewport-location", type=float, nargs=3, default=None, metavar=("X", "Y", "Z"))
+    parser.add_argument(
+        "--viewport-rotation",
+        type=float,
+        nargs=4,
+        default=None,
+        metavar=("W", "X", "Y", "Z"),
+        help="Startup 3D viewport rotation quaternion.",
+    )
+    parser.add_argument("--viewport-distance", type=float, default=None)
+    parser.add_argument("--viewport-lens", type=float, default=None)
+    parser.add_argument(
+        "--viewport-perspective",
+        choices=("PERSP", "ORTHO", "CAMERA"),
+        default=None,
+    )
+    parser.add_argument(
+        "--create-default-camera",
+        action="store_true",
+        help="Create and activate a scene camera aligned to the startup 3D viewport.",
+    )
     parser.add_argument(
         "--avatar-position",
         type=float,
@@ -120,6 +144,11 @@ def parse_args() -> argparse.Namespace:
         help="Optional startup avatar marker position in Blender coordinates.",
     )
     parser.add_argument("--avatar-heading", type=float, default=0.0, help="Startup avatar marker heading in radians.")
+    parser.add_argument(
+        "--show-default-avatar",
+        action="store_true",
+        help="Create a visible skinned bind-pose avatar at the startup position.",
+    )
     argv = sys.argv[sys.argv.index("--") + 1 :] if "--" in sys.argv else sys.argv[1:]
     return parser.parse_args(argv)
 
@@ -166,15 +195,81 @@ def json_state() -> dict[str, Any]:
         "current_frame_count": STATE.current_frame_count,
         "current_fps": STATE.current_fps,
         "current_render_mode": STATE.current_render_mode,
+        "avatar_visible": any(
+            obj.get(AVATAR_OBJECT_PROP) and obj.type == "MESH"
+            for obj in bpy.data.objects
+        ),
         "loop": STATE.loop,
         "last_render_path": STATE.last_render_path,
         "waypoints": serialize_waypoints(),
         "frame_start": int(scene.frame_start),
         "frame_end": int(scene.frame_end),
         "frame_current": int(scene.frame_current),
+        "render_engine": str(scene.render.engine),
+        "gpu": gpu_summary(),
+        "viewport": active_viewport_summary(),
+        "camera": scene_camera_summary(),
         "is_playing": bool(getattr(bpy.context.screen, "is_animation_playing", False))
         if bpy.context.screen is not None
         else False,
+    }
+
+
+def gpu_summary() -> dict[str, str | None]:
+    try:
+        return {
+            "backend": str(gpu.platform.backend_type_get()),
+            "vendor": str(gpu.platform.vendor_get()),
+            "renderer": str(gpu.platform.renderer_get()),
+        }
+    except Exception as error:
+        return {
+            "backend": None,
+            "vendor": None,
+            "renderer": None,
+            "error": str(error),
+        }
+
+
+def active_viewport_summary() -> dict[str, Any] | None:
+    window = bpy.context.window
+    screen = window.screen if window is not None else bpy.context.screen
+    if screen is None:
+        return None
+
+    for area in screen.areas:
+        if area.type != "VIEW_3D":
+            continue
+        for space in area.spaces:
+            if space.type != "VIEW_3D":
+                continue
+            region = space.region_3d
+            eye = region.view_matrix.inverted().translation
+            return {
+                "workspace": window.workspace.name if window is not None else None,
+                "screen": screen.name,
+                "eye": [float(value) for value in eye],
+                "location": [float(value) for value in region.view_location],
+                "rotation": [float(value) for value in region.view_rotation],
+                "distance": float(region.view_distance),
+                "lens": float(space.lens),
+                "perspective": str(region.view_perspective),
+            }
+    return None
+
+
+def scene_camera_summary() -> dict[str, Any] | None:
+    camera = bpy.context.scene.camera
+    if camera is None or camera.type != "CAMERA":
+        return None
+    return {
+        "name": camera.name,
+        "location": [float(value) for value in camera.location],
+        "rotation": [float(value) for value in camera.rotation_euler],
+        "lens": float(camera.data.lens),
+        "shift_x": float(camera.data.shift_x),
+        "shift_y": float(camera.data.shift_y),
+        "is_default": bool(camera.get(DEFAULT_CAMERA_PROP)),
     }
 
 
@@ -355,6 +450,86 @@ def set_viewport_shading(payload: dict[str, Any]) -> dict[str, Any]:
         "use_scene_world": use_scene_world,
     }
     return state
+
+
+def set_viewport_view(payload: dict[str, Any]) -> dict[str, Any]:
+    location = payload.get("location")
+    rotation = payload.get("rotation")
+    if location is not None and (not isinstance(location, list) or len(location) != 3):
+        raise ValueError("location must be a JSON list [x, y, z].")
+    if rotation is not None and (not isinstance(rotation, list) or len(rotation) != 4):
+        raise ValueError("rotation must be a quaternion JSON list [w, x, y, z].")
+
+    changed = 0
+    for window in bpy.context.window_manager.windows:
+        screen = window.screen
+        if screen is None:
+            continue
+        for area in screen.areas:
+            if area.type != "VIEW_3D":
+                continue
+            for space in area.spaces:
+                if space.type != "VIEW_3D":
+                    continue
+                region = space.region_3d
+                if location is not None:
+                    region.view_location = [float(value) for value in location]
+                if rotation is not None:
+                    region.view_rotation = [float(value) for value in rotation]
+                if payload.get("distance") is not None:
+                    region.view_distance = float(payload["distance"])
+                if payload.get("lens") is not None:
+                    space.lens = float(payload["lens"])
+                if payload.get("perspective") is not None:
+                    region.view_perspective = str(payload["perspective"])
+                area.tag_redraw()
+                changed += 1
+
+    state = json_state()
+    viewport_state = state.get("viewport")
+    if viewport_state is None:
+        state["viewport"] = {"viewports_changed": changed}
+    else:
+        viewport_state["viewports_changed"] = changed
+    return state
+
+
+def create_default_camera_from_viewport(payload: dict[str, Any] | None = None) -> dict[str, Any]:
+    payload = payload or {}
+    remove_tagged_objects(DEFAULT_CAMERA_PROP)
+
+    window = bpy.context.window
+    screen = window.screen if window is not None else bpy.context.screen
+    if window is None or screen is None:
+        raise RuntimeError("A Blender window is required to align the default camera.")
+
+    for area in screen.areas:
+        if area.type != "VIEW_3D":
+            continue
+        space = next((item for item in area.spaces if item.type == "VIEW_3D"), None)
+        region = next((item for item in area.regions if item.type == "WINDOW"), None)
+        if space is None or region is None:
+            continue
+
+        name = str(payload.get("name", "ardy_default_camera"))
+        camera_data = bpy.data.cameras.new(name)
+        camera_data.lens = float(space.lens)
+        camera = bpy.data.objects.new(name, camera_data)
+        bpy.context.scene.collection.objects.link(camera)
+        camera[DEFAULT_CAMERA_PROP] = True
+        bpy.context.scene.camera = camera
+
+        with bpy.context.temp_override(
+            window=window,
+            screen=screen,
+            area=area,
+            region=region,
+            space_data=space,
+        ):
+            bpy.ops.view3d.camera_to_view()
+        return json_state()
+
+    raise RuntimeError("The active Blender screen has no 3D viewport.")
 
 
 def mark_objects(objects: list[bpy.types.Object], prop_name: str) -> None:
@@ -582,6 +757,34 @@ def place_avatar(payload: dict[str, Any]) -> dict[str, Any]:
     return state
 
 
+def show_default_avatar(_payload: dict[str, Any] | None = None) -> dict[str, Any]:
+    skin = load_skin_data(77)
+    if skin is None:
+        raise RuntimeError("The SOMA 77-joint skin asset is unavailable.")
+
+    clear_avatar()
+    vertices = to_blender_points(skin.bind_vertices, 1.0)
+    heading = float(STATE.avatar_heading)
+    cosine = float(np.cos(heading))
+    sine = float(np.sin(heading))
+    xy = vertices[:, :2].copy()
+    vertices[:, 0] = cosine * xy[:, 0] - sine * xy[:, 1]
+    vertices[:, 1] = sine * xy[:, 0] + cosine * xy[:, 1]
+    vertices += np.asarray(STATE.avatar_position, dtype=np.float32)
+
+    created = build_skinned_animation(vertices[None, ...], skin.faces)
+    mark_objects(created, AVATAR_OBJECT_PROP)
+    set_start_marker(STATE.avatar_position, STATE.avatar_heading)
+
+    scene = bpy.context.scene
+    scene.frame_start = 1
+    scene.frame_end = 1
+    scene.frame_set(1)
+    STATE.current_frame_count = 1
+    STATE.current_render_mode = "skin"
+    return json_state()
+
+
 def load_motion_into_scene(payload: dict[str, Any]) -> dict[str, Any]:
     motion_path = Path(str(payload.get("motion_path", ""))).expanduser().resolve()
     if not motion_path.exists():
@@ -596,7 +799,7 @@ def load_motion_into_scene(payload: dict[str, Any]) -> dict[str, Any]:
     play = bool(payload.get("play", True))
     loop = bool(payload.get("loop", False))
     show_root_path = bool(payload.get("show_root_path", False))
-    auto_camera = bool(payload.get("auto_camera", True))
+    auto_camera = bool(payload.get("auto_camera", False))
 
     motion = load_motion(motion_path, sample_index, scale)
     joints = motion.joints_blender.copy()
@@ -683,7 +886,10 @@ ROUTES: dict[str, Callable[[dict[str, Any]], dict[str, Any]]] = {
     "/scene/load_usd": import_usd,
     "/scene/lighting": configure_scene_lighting,
     "/viewport/shading": set_viewport_shading,
+    "/viewport/view": set_viewport_view,
+    "/camera/from_viewport": create_default_camera_from_viewport,
     "/avatar/place": place_avatar,
+    "/avatar/show_default": show_default_avatar,
     "/avatar/clear": lambda _payload: clear_avatar(),
     "/waypoints/add": add_waypoint,
     "/waypoints/add_from_cursor": add_waypoint_from_cursor,
@@ -796,8 +1002,26 @@ def main() -> None:
             shading_payload["use_scene_world"] = args.use_scene_world
         set_viewport_shading(shading_payload)
 
+    view_payload: dict[str, Any] = {}
+    for arg_name, payload_name in (
+        ("viewport_location", "location"),
+        ("viewport_rotation", "rotation"),
+        ("viewport_distance", "distance"),
+        ("viewport_lens", "lens"),
+        ("viewport_perspective", "perspective"),
+    ):
+        value = getattr(args, arg_name)
+        if value is not None:
+            view_payload[payload_name] = list(value) if isinstance(value, (tuple, list)) else value
+    if view_payload:
+        set_viewport_view(view_payload)
+    if args.create_default_camera:
+        create_default_camera_from_viewport()
+
     if args.avatar_position is not None:
         place_avatar({"position": list(args.avatar_position), "heading": args.avatar_heading})
+    if args.show_default_avatar:
+        show_default_avatar()
 
 
 if __name__ == "__main__":

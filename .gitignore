@@ -20,6 +20,9 @@ __pycache__/
 
 datasets
 /scene4/
+/assets/*.tar
+/assets/*.tar.*
+/assets/*.zip
 
 # Distribution / packaging
 .Python

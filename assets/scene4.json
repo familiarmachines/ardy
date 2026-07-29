@@ -1,0 +1,14 @@
+{
+  "name": "scene4",
+  "version": "2026-07-29",
+  "drive_folder_id": "1jeaOb4C-koKg0QY1ii-6CcOiWH-q6bfZ",
+  "rclone_remote": "ardy-scene4",
+  "archive": "scene4-v2026-07-29.tar.zst",
+  "remote_path": "scene4-v2026-07-29.tar.zst",
+  "cache_dir": ".cache/assets",
+  "source_dir": "scene4",
+  "extract_to": "scene4",
+  "ready_file": "scene4/scene4/main.usd",
+  "sha256": "3559352bfb665fbbb58b2075fe98850691e783d921753a177b1f667bd893e174",
+  "size_bytes": 1619817885
+}

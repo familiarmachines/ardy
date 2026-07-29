@@ -1,0 +1,4 @@
+interface:
+  display_name: "Launch ARDY Blender"
+  short_description: "Start Scene4 with the ARDY avatar ready"
+  default_prompt: "Use $launch-ardy-blender to start Blender with Scene4 and the avatar at its default position."

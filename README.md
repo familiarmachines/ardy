@@ -295,6 +295,38 @@ To run an existing motion in a visible Blender session without exporting a video
 
 To export MP4 as well, omit `--live-only` and add `--output outputs/api/walk_wave_live.mp4`.
 
+### Codex Skill
+
+The repository includes a Codex skill for reproducing the Scene4 Blender development session:
+`.agents/skills/launch-ardy-blender`. Codex discovers repository skills automatically when started
+anywhere inside this Git checkout, so no installation step is required. Run `/skills` to confirm it
+is available, then invoke it explicitly:
+
+```text
+Use $launch-ardy-blender to start Blender.
+```
+
+To make the skill available when Codex starts outside this repository, install it for the current
+user with a symlink. Run these commands from anywhere inside the ARDY checkout:
+
+```bash
+repo_root="$(git rev-parse --show-toplevel)"
+mkdir -p "$HOME/.agents/skills"
+ln -s "$repo_root/.agents/skills/launch-ardy-blender" \
+  "$HOME/.agents/skills/launch-ardy-blender"
+```
+
+The symlink keeps the installed skill synchronized with repository updates. If a different copy
+already exists at that destination, remove or rename it before creating the symlink. Set
+`ARDY_REPO` to the checkout path when using a copied skill instead:
+
+```bash
+export ARDY_REPO=/absolute/path/to/ardy
+```
+
+Codex normally detects skill changes automatically. Restart Codex if a newly installed or updated
+skill does not appear in `/skills`.
+
 ### Persistent Live Blender Session
 
 For USD-scene workflows, keep Blender running and update the same avatar in-place instead of
@@ -308,7 +340,7 @@ Blender process.
 ~/Projects/blender/blender --python scripts/blender_live_server.py -- --port 9876
 
 # Optional scene4 dev startup: starts Blender with the textured USD wrapper, dimmed scene lights,
-# Rendered viewport shading, and the default avatar marker.
+# Rendered viewport shading, and a visible skinned avatar at the default position.
 scripts/start_scene4_live_blender.sh
 
 # Terminal 2: start the stateful ARDY session API.
@@ -344,15 +376,68 @@ python scripts/live_session_client.py prompt \
   --output waypoint_walk
 ```
 
-The scene4 launcher expects the local scene asset at `scene4/scene4/main.usd`. On first run it creates
-`outputs/live_api/scene4_textured.usda`, a lightweight wrapper layer that converts scene4's custom
-texture inputs into Blender-readable `UsdPreviewSurface` material networks. The source `scene4/`
-asset folder is intentionally ignored by git because it is large.
+The scene4 launcher expects the local scene asset at `scene4/scene4/main.usd`. The source `scene4/`
+asset folder is intentionally ignored by git because it is large. For private team development, the
+asset pack lives in the shared Google Drive folder recorded by `assets/scene4.json`. Install and
+configure `rclone` once:
+
+```bash
+curl https://rclone.org/install.sh | sudo bash
+rclone config
+```
+
+Create a Google Drive remote named `ardy-scene4`, enable advanced config, and set
+`root_folder_id` to:
+
+```text
+1jeaOb4C-koKg0QY1ii-6CcOiWH-q6bfZ
+```
+
+Then fetch the asset:
+
+```bash
+python scripts/fetch_scene4.py
+```
+
+`scripts/start_scene4_live_blender.sh` runs the same fetch automatically when
+`scene4/scene4/main.usd` is missing. Set `ARDY_SCENE4_FETCH=0` to disable that behavior.
+
+On first run after the asset is present, the launcher creates `outputs/live_api/scene4_textured.usda`,
+a lightweight wrapper layer that converts scene4's custom texture inputs into Blender-readable
+`UsdPreviewSurface` material networks.
+
+The launcher uses Blender's Vulkan backend, selects the first NVIDIA GPU reported by Blender, and
+disables device fallback so a failed selection cannot silently use integrated graphics. Override the
+selection with `ARDY_BLENDER_GPU_DEVICE`; list valid devices with:
+
+```bash
+~/Projects/blender/blender --gpu-backend vulkan --gpu-device help
+```
+
+The live server's `/health` response reports the active GPU backend, vendor, and renderer.
+It also reports the active 3D viewport transform. The scene4 launcher restores the preferred
+Layout viewport captured for development and creates the active render camera from that view.
+Live motion prompts retain this camera by default; pass `--auto-camera` to replace it with automatic
+motion framing for a specific prompt.
+
+Maintainers can create and upload a new versioned asset pack with:
+
+```bash
+python scripts/package_scene4.py --version 2026-07-29 --reuse-existing --upload
+git add assets/scene4.json
+```
+
+The generated archive is stored under `.cache/assets/` locally and is not committed. Commit only the
+updated manifest after upload.
 
 Equivalent manual startup:
 
 ```bash
-~/Projects/blender/blender --python scripts/blender_live_server.py -- \
+~/Projects/blender/blender \
+  --gpu-backend vulkan \
+  --gpu-device 1 \
+  --gpu-device-no-fallback \
+  --python scripts/blender_live_server.py -- \
   --port 9876 \
   --width 640 \
   --height 360 \
@@ -366,8 +451,15 @@ Equivalent manual startup:
   --viewport-shading RENDERED \
   --use-scene-lights \
   --use-scene-world \
+  --viewport-location -0.0206932481 -0.0460254699 0.0006694308 \
+  --viewport-rotation 0.8370923996 0.5182799101 0.0921778455 0.1488799900 \
+  --viewport-distance 5.1317672729 \
+  --viewport-lens 50.0 \
+  --viewport-perspective PERSP \
+  --create-default-camera \
   --avatar-position 0.5 0.25 0.0 \
-  --avatar-heading 0.0
+  --avatar-heading 0.0 \
+  --show-default-avatar
 ```
 
 `place --position X Y Z` uses Blender coordinates. `X/Y` become ARDY's ground-plane root

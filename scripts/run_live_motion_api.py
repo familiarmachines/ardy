@@ -361,7 +361,7 @@ class LiveMotionSession:
                     "play": bool(payload.get("play", True)),
                     "loop": bool(payload.get("loop", False)),
                     "show_root_path": bool(payload.get("show_root_path", False)),
-                    "auto_camera": bool(payload.get("auto_camera", True)),
+                    "auto_camera": bool(payload.get("auto_camera", False)),
                     "save_blend": payload.get("save_blend"),
                 },
                 timeout=float(payload.get("blender_timeout", 600.0)),
