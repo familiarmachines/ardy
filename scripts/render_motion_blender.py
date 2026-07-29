@@ -61,6 +61,7 @@ class MotionData:
 @dataclass
 class SkinData:
     path: Path
+    rig_joint_names: tuple[str, ...]
     bind_vertices: np.ndarray
     faces: np.ndarray
     bind_rig_transform: np.ndarray
@@ -157,6 +158,7 @@ def load_skin_data(joint_count: int) -> SkinData | None:
 
     return SkinData(
         path=path,
+        rig_joint_names=tuple(str(name) for name in data["rig_joint_names"]),
         bind_vertices=np.asarray(data["bind_vertices"], dtype=np.float32),
         faces=np.asarray(data["faces"], dtype=np.int64),
         bind_rig_transform=bind_rig_transform,

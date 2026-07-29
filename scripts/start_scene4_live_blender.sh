@@ -73,6 +73,7 @@ exec "$BLENDER" \
   --viewport-lens 50.0 \
   --viewport-perspective PERSP \
   --create-default-camera \
+  --create-forehead-camera \
   --avatar-position 0.5 0.25 0.0 \
   --avatar-heading 0.0 \
   --show-default-avatar

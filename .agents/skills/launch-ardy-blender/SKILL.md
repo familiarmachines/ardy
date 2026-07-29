@@ -1,6 +1,6 @@
 ---
 name: launch-ardy-blender
-description: Launch and verify the persistent ARDY Blender development session with the textured Scene4 USD, preferred scene camera and Layout viewport, NVIDIA GPU rendering, live HTTP control server, and a visible skinned human avatar at the default position. Use when asked to start, launch, open, initialize, or reproduce the ARDY Scene4 Blender environment in a new Codex session.
+description: Launch and verify the persistent ARDY Blender development session with the textured Scene4 USD, preferred scene and animated forehead cameras, Layout viewport, NVIDIA GPU rendering, live HTTP control server, and a visible skinned human avatar at the default position. Use when asked to start, launch, open, initialize, or reproduce the ARDY Scene4 Blender environment in a new Codex session.
 ---
 
 # Launch ARDY Blender
@@ -63,6 +63,10 @@ Require all of the following:
 - `camera.name` is `ardy_default_camera`.
 - `camera.location` is approximately `[1.5632056, -4.3579917, 2.2882988]`.
 - `camera.is_default` is `true`, and `camera.lens` is `50.0`.
+- `forehead_camera.enabled` and `forehead_camera.exists` are `true`.
+- `forehead_camera.active` is `false`, preserving the preferred scene camera at startup.
+- `forehead_camera.offset` is `[0.0, 0.16, 0.08]`, its lens is `18.0`, and
+  `forehead_camera.tracked_frame_count` is `1` for the default bind pose.
 
 The default avatar is the skinned neutral bind pose. A generated motion replaces it in the same
 Blender session.
@@ -72,6 +76,6 @@ graphics or restart a responsive Blender session.
 
 ## Report
 
-Return the Blender API URL, Scene4 path, avatar position, active camera and viewport eye positions,
-render engine, and GPU renderer. Mention whether a new process was launched or an existing healthy
-process was reused.
+Return the Blender API URL, Scene4 path, avatar position, active camera, forehead-camera status,
+viewport eye position, render engine, and GPU renderer. Mention whether a new process was launched
+or an existing healthy process was reused.

@@ -695,6 +695,16 @@ class LiveMotionHandler(BaseHTTPRequestHandler):
                 response = self.server.session.configure_lighting(payload)
             elif route == "/viewport/shading":
                 response = self.server.session.set_viewport_shading(payload)
+            elif route in {
+                "/camera/forehead/configure",
+                "/camera/forehead/remove",
+                "/camera/select",
+            }:
+                response = self.server.session._post_blender(
+                    route,
+                    payload,
+                    timeout=float(payload.get("timeout", 30.0)),
+                )
             elif route == "/avatar/place":
                 response = self.server.session.place_avatar(payload)
             elif route == "/waypoints/add":

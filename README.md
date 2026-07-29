@@ -340,7 +340,7 @@ Blender process.
 ~/Projects/blender/blender --python scripts/blender_live_server.py -- --port 9876
 
 # Optional scene4 dev startup: starts Blender with the textured USD wrapper, dimmed scene lights,
-# Rendered viewport shading, and a visible skinned avatar at the default position.
+# Rendered viewport shading, a visible skinned avatar, and default plus forehead cameras.
 scripts/start_scene4_live_blender.sh
 
 # Terminal 2: start the stateful ARDY session API.
@@ -375,6 +375,40 @@ python scripts/live_session_client.py prompt \
   --show-root-path \
   --output waypoint_walk
 ```
+
+The Scene4 launcher also creates `ardy_forehead_camera`, mounted to ARDY's animated `Head` joint.
+The preferred third-person camera remains active at startup. Switch the live camera view without
+restarting Blender:
+
+```bash
+# Select the forehead camera using its default 18 mm lens.
+python scripts/live_session_client.py select-camera forehead
+
+# Adjust the head-local mount as lateral, forward, and up offsets in meters.
+python scripts/live_session_client.py forehead-camera \
+  --offset 0.0 0.16 0.08 \
+  --lens 18 \
+  --clip-start 0.02 \
+  --activate
+
+# Return to the preferred scene camera.
+python scripts/live_session_client.py select-camera scene
+
+# Render from the forehead camera without changing the live active camera.
+python scripts/live_session_client.py render-mp4 \
+  outputs/live_api/forehead_view.mp4 \
+  --camera forehead
+
+# Render from the preferred scene camera.
+python scripts/live_session_client.py render-mp4 \
+  outputs/live_api/scene_view.mp4 \
+  --camera scene
+```
+
+The forehead camera follows the full head position and orientation, including pitch, yaw, and roll.
+Its mount survives avatar replacement, so each new motion updates the same camera in the persistent
+Blender session. The `/health` response reports its world transform, mount settings, tracked frame
+count, and whether it is active.
 
 The scene4 launcher expects the local scene asset at `scene4/scene4/main.usd`. The source `scene4/`
 asset folder is intentionally ignored by git because it is large. For private team development, the
@@ -457,6 +491,7 @@ Equivalent manual startup:
   --viewport-lens 50.0 \
   --viewport-perspective PERSP \
   --create-default-camera \
+  --create-forehead-camera \
   --avatar-position 0.5 0.25 0.0 \
   --avatar-heading 0.0 \
   --show-default-avatar

@@ -18,16 +18,23 @@ from urllib.parse import urlparse
 import bpy
 import gpu
 import numpy as np
-from mathutils import Vector
+from mathutils import Matrix, Vector
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
+from forehead_camera import (  # noqa: E402
+    HeadTransformTrack,
+    build_head_transform_track,
+    transform_track,
+)
 from render_motion_blender import (  # noqa: E402
     ANIMATED_MESHES,
     PARENTS_BY_JOINT_COUNT,
+    MotionData,
+    SkinData,
     add_camera_and_light,
     build_animation,
     build_skinned_animation,
@@ -51,9 +58,25 @@ DEFAULT_PORT = 9876
 AVATAR_OBJECT_PROP = "ardy_live_avatar_object"
 CAMERA_OBJECT_PROP = "ardy_live_camera_object"
 DEFAULT_CAMERA_PROP = "ardy_default_camera_object"
+FOREHEAD_CAMERA_PROP = "ardy_forehead_camera_object"
+FOREHEAD_MOUNT_PROP = "ardy_forehead_camera_mount"
 WAYPOINT_OBJECT_PROP = "ardy_live_waypoint_object"
 START_MARKER_NAME = "ardy_avatar_start"
+FOREHEAD_CAMERA_NAME = "ardy_forehead_camera"
+FOREHEAD_MOUNT_NAME = "ardy_head_mount"
 ORIGINAL_LIGHT_ENERGY_PROP = "ardy_original_light_energy"
+DEFAULT_FOREHEAD_CAMERA_OFFSET = (0.0, 0.16, 0.08)
+DEFAULT_FOREHEAD_CAMERA_LENS = 18.0
+DEFAULT_FOREHEAD_CAMERA_CLIP_START = 0.02
+
+
+FOREHEAD_CAMERA_LOCAL_ROTATION = Matrix(
+    (
+        (1.0, 0.0, 0.0),
+        (0.0, 0.0, -1.0),
+        (0.0, 1.0, 0.0),
+    )
+)
 
 
 @dataclass
@@ -69,10 +92,19 @@ class LiveBlenderState:
     loop: bool = False
     last_render_path: str | None = None
     waypoints: list[dict[str, Any]] = field(default_factory=list)
+    current_scale: float = 1.0
+    forehead_camera_enabled: bool = False
+    forehead_camera_offset: list[float] = field(
+        default_factory=lambda: list(DEFAULT_FOREHEAD_CAMERA_OFFSET)
+    )
+    forehead_camera_lens: float = DEFAULT_FOREHEAD_CAMERA_LENS
+    forehead_camera_clip_start: float = DEFAULT_FOREHEAD_CAMERA_CLIP_START
+    forehead_camera_tracking_error: str | None = None
 
 
 STATE = LiveBlenderState()
 TASK_QUEUE: queue.Queue["BlenderTask"] = queue.Queue()
+FOREHEAD_CAMERA_TRACK: HeadTransformTrack | None = None
 
 
 @dataclass
@@ -134,6 +166,31 @@ def parse_args() -> argparse.Namespace:
         "--create-default-camera",
         action="store_true",
         help="Create and activate a scene camera aligned to the startup 3D viewport.",
+    )
+    parser.add_argument(
+        "--create-forehead-camera",
+        action="store_true",
+        help="Create a persistent camera mounted to the avatar's animated Head joint.",
+    )
+    parser.add_argument(
+        "--forehead-camera-offset",
+        type=float,
+        nargs=3,
+        default=DEFAULT_FOREHEAD_CAMERA_OFFSET,
+        metavar=("LATERAL", "FORWARD", "UP"),
+        help="Head-local camera offset in meters. Default: 0 0.16 0.08.",
+    )
+    parser.add_argument(
+        "--forehead-camera-lens",
+        type=float,
+        default=DEFAULT_FOREHEAD_CAMERA_LENS,
+        help="Forehead camera focal length in millimeters. Default: 18.",
+    )
+    parser.add_argument(
+        "--forehead-camera-clip-start",
+        type=float,
+        default=DEFAULT_FOREHEAD_CAMERA_CLIP_START,
+        help="Forehead camera near clipping distance in meters. Default: 0.02.",
     )
     parser.add_argument(
         "--avatar-position",
@@ -209,6 +266,7 @@ def json_state() -> dict[str, Any]:
         "gpu": gpu_summary(),
         "viewport": active_viewport_summary(),
         "camera": scene_camera_summary(),
+        "forehead_camera": forehead_camera_summary(),
         "is_playing": bool(getattr(bpy.context.screen, "is_animation_playing", False))
         if bpy.context.screen is not None
         else False,
@@ -270,7 +328,32 @@ def scene_camera_summary() -> dict[str, Any] | None:
         "shift_x": float(camera.data.shift_x),
         "shift_y": float(camera.data.shift_y),
         "is_default": bool(camera.get(DEFAULT_CAMERA_PROP)),
+        "is_forehead": bool(camera.get(FOREHEAD_CAMERA_PROP)),
     }
+
+
+def forehead_camera_summary() -> dict[str, Any]:
+    camera = bpy.data.objects.get(FOREHEAD_CAMERA_NAME)
+    mount = bpy.data.objects.get(FOREHEAD_MOUNT_NAME)
+    track = FOREHEAD_CAMERA_TRACK
+    summary: dict[str, Any] = {
+        "enabled": STATE.forehead_camera_enabled,
+        "exists": bool(camera is not None and camera.type == "CAMERA"),
+        "active": bool(camera is not None and bpy.context.scene.camera == camera),
+        "name": camera.name if camera is not None else FOREHEAD_CAMERA_NAME,
+        "mount_name": mount.name if mount is not None else FOREHEAD_MOUNT_NAME,
+        "offset": list(STATE.forehead_camera_offset),
+        "lens": STATE.forehead_camera_lens,
+        "clip_start": STATE.forehead_camera_clip_start,
+        "tracked_frame_count": int(track.locations.shape[0]) if track is not None else 0,
+        "tracking_error": STATE.forehead_camera_tracking_error,
+    }
+    if camera is not None and camera.type == "CAMERA":
+        summary["world_location"] = [float(value) for value in camera.matrix_world.translation]
+        summary["world_rotation"] = [
+            float(value) for value in camera.matrix_world.to_euler()
+        ]
+    return summary
 
 
 def scene_lighting_summary() -> dict[str, Any]:
@@ -327,19 +410,30 @@ def waypoint_state(**extra: Any) -> dict[str, Any]:
 
 
 def clear_avatar() -> dict[str, Any]:
+    global FOREHEAD_CAMERA_TRACK
+
     stop_playback()
     ANIMATED_MESHES.clear()
     remove_tagged_objects(AVATAR_OBJECT_PROP)
+    FOREHEAD_CAMERA_TRACK = None
     STATE.current_motion_path = None
     STATE.current_prompt = None
     STATE.current_frame_count = 0
+    STATE.forehead_camera_tracking_error = None
     return json_state()
 
 
 def clear_scene() -> None:
+    global FOREHEAD_CAMERA_TRACK
+
     stop_playback()
     ANIMATED_MESHES.clear()
+    FOREHEAD_CAMERA_TRACK = None
     STATE.waypoints.clear()
+    STATE.current_motion_path = None
+    STATE.current_prompt = None
+    STATE.current_frame_count = 0
+    STATE.forehead_camera_tracking_error = None
     bpy.ops.object.select_all(action="SELECT")
     bpy.ops.object.delete()
 
@@ -358,6 +452,8 @@ def import_usd(payload: dict[str, Any]) -> dict[str, Any]:
             import_args[key] = payload[key]
     bpy.ops.wm.usd_import(**import_args)
     STATE.usd_path = str(path)
+    if STATE.forehead_camera_enabled:
+        ensure_forehead_camera()
     return json_state()
 
 
@@ -530,6 +626,224 @@ def create_default_camera_from_viewport(payload: dict[str, Any] | None = None) -
         return json_state()
 
     raise RuntimeError("The active Blender screen has no 3D viewport.")
+
+
+def update_forehead_camera(scene: bpy.types.Scene) -> None:
+    track = FOREHEAD_CAMERA_TRACK
+    mount = bpy.data.objects.get(FOREHEAD_MOUNT_NAME)
+    if track is None or mount is None:
+        return
+
+    frame_idx = max(0, int(scene.frame_current) - int(scene.frame_start))
+    frame_idx = min(frame_idx, int(track.locations.shape[0]) - 1)
+    location = Vector(track.locations[frame_idx].tolist())
+    rotation = Matrix(track.rotations[frame_idx].tolist())
+    mount.matrix_world = Matrix.Translation(location) @ rotation.to_4x4()
+
+
+def register_forehead_camera_frame_handler() -> None:
+    handlers = bpy.app.handlers.frame_change_pre
+    for handler in list(handlers):
+        if getattr(handler, "__name__", "") == "update_forehead_camera":
+            handlers.remove(handler)
+    handlers.append(update_forehead_camera)
+
+
+def set_camera_view(camera: bpy.types.Object) -> None:
+    bpy.context.scene.camera = camera
+    for window in bpy.context.window_manager.windows:
+        screen = window.screen
+        if screen is None:
+            continue
+        for area in screen.areas:
+            if area.type != "VIEW_3D":
+                continue
+            for space in area.spaces:
+                if space.type == "VIEW_3D":
+                    space.region_3d.view_perspective = "CAMERA"
+                    area.tag_redraw()
+
+
+def find_default_camera() -> bpy.types.Object | None:
+    return next(
+        (
+            obj
+            for obj in bpy.data.objects
+            if obj.type == "CAMERA" and obj.get(DEFAULT_CAMERA_PROP)
+        ),
+        None,
+    )
+
+
+def ensure_forehead_camera() -> tuple[bpy.types.Object, bpy.types.Object]:
+    mount = bpy.data.objects.get(FOREHEAD_MOUNT_NAME)
+    if mount is not None and mount.type != "EMPTY":
+        raise RuntimeError(
+            f"{FOREHEAD_MOUNT_NAME} exists but is not an Empty object."
+        )
+    if mount is None:
+        mount = bpy.data.objects.new(FOREHEAD_MOUNT_NAME, None)
+        bpy.context.scene.collection.objects.link(mount)
+    mount.empty_display_type = "ARROWS"
+    mount.empty_display_size = 0.08
+    mount.hide_render = True
+    mount[FOREHEAD_MOUNT_PROP] = True
+
+    camera = bpy.data.objects.get(FOREHEAD_CAMERA_NAME)
+    if camera is not None and camera.type != "CAMERA":
+        raise RuntimeError(
+            f"{FOREHEAD_CAMERA_NAME} exists but is not a Camera object."
+        )
+    if camera is None:
+        camera_data = bpy.data.cameras.new(FOREHEAD_CAMERA_NAME)
+        camera = bpy.data.objects.new(FOREHEAD_CAMERA_NAME, camera_data)
+        bpy.context.scene.collection.objects.link(camera)
+
+    camera[FOREHEAD_CAMERA_PROP] = True
+    camera.parent = mount
+    camera.location = [
+        float(value) * float(STATE.current_scale)
+        for value in STATE.forehead_camera_offset
+    ]
+    camera.rotation_mode = "QUATERNION"
+    camera.rotation_quaternion = FOREHEAD_CAMERA_LOCAL_ROTATION.to_quaternion()
+    camera.scale = (1.0, 1.0, 1.0)
+    camera.data.lens = float(STATE.forehead_camera_lens)
+    camera.data.clip_start = float(STATE.forehead_camera_clip_start)
+    camera.data.dof.use_dof = False
+
+    register_forehead_camera_frame_handler()
+    update_forehead_camera(bpy.context.scene)
+    return mount, camera
+
+
+def configure_forehead_camera(payload: dict[str, Any] | None = None) -> dict[str, Any]:
+    payload = payload or {}
+    offset = payload.get("offset")
+    if offset is not None:
+        if not isinstance(offset, list) or len(offset) != 3:
+            raise ValueError(
+                "offset must be [lateral, forward, up] in head-local meters."
+            )
+        STATE.forehead_camera_offset = [float(value) for value in offset]
+
+    if payload.get("lens") is not None:
+        lens = float(payload["lens"])
+        if lens <= 0.0:
+            raise ValueError("lens must be positive.")
+        STATE.forehead_camera_lens = lens
+    if payload.get("clip_start") is not None:
+        clip_start = float(payload["clip_start"])
+        if clip_start <= 0.0:
+            raise ValueError("clip_start must be positive.")
+        STATE.forehead_camera_clip_start = clip_start
+
+    STATE.forehead_camera_enabled = True
+    _, camera = ensure_forehead_camera()
+    bpy.context.view_layer.update()
+    if bool(payload.get("activate", False)):
+        set_camera_view(camera)
+    return json_state()
+
+
+def resolve_camera(target: str) -> bpy.types.Object:
+    normalized = target.strip().lower().replace("-", "_")
+    if normalized in {"forehead", "head", "first_person"}:
+        STATE.forehead_camera_enabled = True
+        _, camera = ensure_forehead_camera()
+        return camera
+    if normalized in {"default", "scene", "third_person"}:
+        camera = find_default_camera()
+        if camera is None:
+            raise RuntimeError("The default ARDY scene camera is unavailable.")
+        return camera
+
+    camera = bpy.data.objects.get(target)
+    if camera is None or camera.type != "CAMERA":
+        raise ValueError(f"Unknown camera {target!r}.")
+    return camera
+
+
+def select_camera(payload: dict[str, Any]) -> dict[str, Any]:
+    target = str(payload.get("camera", payload.get("name", "")))
+    if not target:
+        raise ValueError("camera is required.")
+    set_camera_view(resolve_camera(target))
+    return json_state()
+
+
+def remove_forehead_camera(_payload: dict[str, Any] | None = None) -> dict[str, Any]:
+    global FOREHEAD_CAMERA_TRACK
+
+    camera = bpy.data.objects.get(FOREHEAD_CAMERA_NAME)
+    if camera is not None:
+        if bpy.context.scene.camera == camera:
+            bpy.context.scene.camera = find_default_camera()
+        camera_data = camera.data
+        bpy.data.objects.remove(camera, do_unlink=True)
+        if camera_data is not None and camera_data.users == 0:
+            bpy.data.cameras.remove(camera_data)
+
+    mount = bpy.data.objects.get(FOREHEAD_MOUNT_NAME)
+    if mount is not None:
+        bpy.data.objects.remove(mount, do_unlink=True)
+
+    FOREHEAD_CAMERA_TRACK = None
+    STATE.forehead_camera_enabled = False
+    STATE.forehead_camera_tracking_error = None
+    return json_state()
+
+
+def set_forehead_camera_track(
+    track: HeadTransformTrack | None,
+    *,
+    error: str | None = None,
+) -> None:
+    global FOREHEAD_CAMERA_TRACK
+
+    FOREHEAD_CAMERA_TRACK = track
+    STATE.forehead_camera_tracking_error = error
+    if STATE.forehead_camera_enabled:
+        ensure_forehead_camera()
+    update_forehead_camera(bpy.context.scene)
+    bpy.context.view_layer.update()
+
+
+def build_motion_head_track(
+    motion: MotionData,
+    skin: SkinData | None,
+    *,
+    scale: float,
+    vertical_offset: float,
+) -> HeadTransformTrack:
+    if skin is None:
+        raise ValueError(
+            f"No rig metadata is available for {motion.joints_ardy.shape[1]} joints."
+        )
+    if motion.global_rot_mats is None:
+        raise ValueError("The motion file does not contain global_rot_mats.")
+    return build_head_transform_track(
+        motion.joints_ardy,
+        motion.global_rot_mats,
+        skin.rig_joint_names,
+        scale=scale,
+        vertical_offset=vertical_offset,
+    )
+
+
+def build_bind_pose_head_track(
+    skin: SkinData,
+    *,
+    heading: float,
+    translation: list[float],
+) -> HeadTransformTrack:
+    bind = skin.bind_rig_transform
+    track = build_head_transform_track(
+        bind[None, :, :3, 3],
+        bind[None, :, :3, :3],
+        skin.rig_joint_names,
+    )
+    return transform_track(track, heading=heading, translation=translation)
 
 
 def mark_objects(objects: list[bpy.types.Object], prop_name: str) -> None:
@@ -740,6 +1054,21 @@ def translate_loaded_avatar(delta: Vector) -> int:
     return moved
 
 
+def translate_forehead_camera_track(delta: Vector) -> None:
+    global FOREHEAD_CAMERA_TRACK
+
+    track = FOREHEAD_CAMERA_TRACK
+    if track is None or delta.length == 0.0:
+        return
+    FOREHEAD_CAMERA_TRACK = HeadTransformTrack(
+        locations=track.locations + np.asarray(tuple(delta), dtype=np.float32),
+        rotations=track.rotations,
+        head_index=track.head_index,
+    )
+    update_forehead_camera(bpy.context.scene)
+    bpy.context.view_layer.update()
+
+
 def place_avatar(payload: dict[str, Any]) -> dict[str, Any]:
     position = payload.get("position", STATE.avatar_position)
     if not isinstance(position, list) or len(position) != 3:
@@ -748,6 +1077,7 @@ def place_avatar(payload: dict[str, Any]) -> dict[str, Any]:
     next_position = [float(value) for value in position]
     delta = Vector(next_position) - Vector(STATE.avatar_position)
     moved_objects = translate_loaded_avatar(delta)
+    translate_forehead_camera_track(delta)
 
     STATE.avatar_position = next_position
     STATE.avatar_heading = float(payload.get("heading", STATE.avatar_heading))
@@ -762,7 +1092,13 @@ def show_default_avatar(_payload: dict[str, Any] | None = None) -> dict[str, Any
     if skin is None:
         raise RuntimeError("The SOMA 77-joint skin asset is unavailable.")
 
+    head_track = build_bind_pose_head_track(
+        skin,
+        heading=float(STATE.avatar_heading),
+        translation=STATE.avatar_position,
+    )
     clear_avatar()
+    STATE.current_scale = 1.0
     vertices = to_blender_points(skin.bind_vertices, 1.0)
     heading = float(STATE.avatar_heading)
     cosine = float(np.cos(heading))
@@ -782,6 +1118,7 @@ def show_default_avatar(_payload: dict[str, Any] | None = None) -> dict[str, Any
     scene.frame_set(1)
     STATE.current_frame_count = 1
     STATE.current_render_mode = "skin"
+    set_forehead_camera_track(head_track)
     return json_state()
 
 
@@ -810,6 +1147,18 @@ def load_motion_into_scene(payload: dict[str, Any]) -> dict[str, Any]:
 
     skin = load_skin_data(joints.shape[1])
     resolved_mode = resolve_render_mode(render_mode, motion, skin)
+    try:
+        head_track = build_motion_head_track(
+            motion,
+            skin,
+            scale=scale,
+            vertical_offset=vertical_offset,
+        )
+        head_tracking_error = None
+    except ValueError as error:
+        head_track = None
+        head_tracking_error = str(error)
+
     mesh_vertices = None
     bounds_points = joints
     if resolved_mode in {"skin", "both"}:
@@ -819,6 +1168,7 @@ def load_motion_into_scene(payload: dict[str, Any]) -> dict[str, Any]:
         bounds_points = mesh_vertices
 
     clear_avatar()
+    STATE.current_scale = scale
     setup_world(bounds_points, width, height, motion.fps)
 
     created: list[bpy.types.Object] = []
@@ -833,6 +1183,7 @@ def load_motion_into_scene(payload: dict[str, Any]) -> dict[str, Any]:
         created_root = add_root_path(joints[:, 0], make_material("ardy_live_root_path_material", (1.0, 0.35, 0.08, 1.0)))
         created.append(created_root)
 
+    set_forehead_camera_track(head_track, error=head_tracking_error)
     if auto_camera:
         update_auto_camera(bounds_points)
 
@@ -843,6 +1194,7 @@ def load_motion_into_scene(payload: dict[str, Any]) -> dict[str, Any]:
     STATE.current_render_mode = resolved_mode
     STATE.loop = loop
     update_ardy_animated_meshes(bpy.context.scene)
+    update_forehead_camera(bpy.context.scene)
 
     save_blend = payload.get("save_blend")
     if save_blend:
@@ -874,12 +1226,28 @@ def render_mp4(payload: dict[str, Any]) -> dict[str, Any]:
         raise ValueError("output is required.")
     output.parent.mkdir(parents=True, exist_ok=True)
     scene = bpy.context.scene
-    with __import__("tempfile").TemporaryDirectory(prefix="ardy_live_blender_frames_") as tmpdir:
-        configure_frame_output(Path(tmpdir))
-        bpy.ops.render.render(animation=True)
-        encode_video(Path(tmpdir), output, float(scene.render.fps))
+    previous_camera = scene.camera
+    requested_camera = str(payload.get("camera", "active"))
+    render_camera = (
+        previous_camera
+        if requested_camera.strip().lower() == "active"
+        else resolve_camera(requested_camera)
+    )
+    if render_camera is None:
+        raise RuntimeError("No active Blender camera is available for rendering.")
+
+    scene.camera = render_camera
+    try:
+        with __import__("tempfile").TemporaryDirectory(prefix="ardy_live_blender_frames_") as tmpdir:
+            configure_frame_output(Path(tmpdir))
+            bpy.ops.render.render(animation=True)
+            encode_video(Path(tmpdir), output, float(scene.render.fps))
+    finally:
+        scene.camera = previous_camera
     STATE.last_render_path = str(output)
-    return json_state()
+    state = json_state()
+    state["last_render_camera"] = render_camera.name
+    return state
 
 
 ROUTES: dict[str, Callable[[dict[str, Any]], dict[str, Any]]] = {
@@ -888,6 +1256,9 @@ ROUTES: dict[str, Callable[[dict[str, Any]], dict[str, Any]]] = {
     "/viewport/shading": set_viewport_shading,
     "/viewport/view": set_viewport_view,
     "/camera/from_viewport": create_default_camera_from_viewport,
+    "/camera/forehead/configure": configure_forehead_camera,
+    "/camera/forehead/remove": remove_forehead_camera,
+    "/camera/select": select_camera,
     "/avatar/place": place_avatar,
     "/avatar/show_default": show_default_avatar,
     "/avatar/clear": lambda _payload: clear_avatar(),
@@ -1017,6 +1388,14 @@ def main() -> None:
         set_viewport_view(view_payload)
     if args.create_default_camera:
         create_default_camera_from_viewport()
+    if args.create_forehead_camera:
+        configure_forehead_camera(
+            {
+                "offset": list(args.forehead_camera_offset),
+                "lens": args.forehead_camera_lens,
+                "clip_start": args.forehead_camera_clip_start,
+            }
+        )
 
     if args.avatar_position is not None:
         place_avatar({"position": list(args.avatar_position), "heading": args.avatar_heading})

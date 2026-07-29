@@ -51,6 +51,40 @@ def parse_args() -> argparse.Namespace:
     viewport.add_argument("--use-scene-world", action=argparse.BooleanOptionalAction, default=None)
     viewport.add_argument("--timeout", type=float, default=30.0)
 
+    forehead_camera = subparsers.add_parser(
+        "forehead-camera",
+        help="Create or configure the avatar's persistent forehead camera.",
+    )
+    forehead_camera.add_argument(
+        "--offset",
+        type=float,
+        nargs=3,
+        default=None,
+        metavar=("LATERAL", "FORWARD", "UP"),
+        help="Head-local camera offset in meters.",
+    )
+    forehead_camera.add_argument("--lens", type=float, default=None, help="Focal length in millimeters.")
+    forehead_camera.add_argument("--clip-start", type=float, default=None, help="Near clipping distance.")
+    forehead_camera.add_argument("--activate", action="store_true", help="Switch the live view to this camera.")
+    forehead_camera.add_argument("--timeout", type=float, default=30.0)
+
+    remove_forehead_camera = subparsers.add_parser(
+        "remove-forehead-camera",
+        help="Remove the forehead camera and its head mount.",
+    )
+    remove_forehead_camera.add_argument("--timeout", type=float, default=30.0)
+
+    select_camera = subparsers.add_parser(
+        "select-camera",
+        help="Select the scene or forehead camera.",
+    )
+    select_camera.add_argument(
+        "camera",
+        choices=("scene", "forehead", "default"),
+        help="'default' is retained as an alias for 'scene'.",
+    )
+    select_camera.add_argument("--timeout", type=float, default=30.0)
+
     subparsers.add_parser("waypoints", help="List waypoint markers stored in the live Blender session.")
 
     add_waypoint = subparsers.add_parser("add-waypoint", help="Add a waypoint from the 3D cursor or a coordinate.")
@@ -137,6 +171,12 @@ def parse_args() -> argparse.Namespace:
 
     render = subparsers.add_parser("render-mp4", help="Export the current Blender animation to MP4.")
     render.add_argument("output", help="MP4 output path.")
+    render.add_argument(
+        "--camera",
+        choices=("active", "scene", "forehead", "default"),
+        default="active",
+        help="Camera used for this export. 'default' aliases 'scene'; the live camera is restored afterward.",
+    )
 
     return parser.parse_args()
 
@@ -236,6 +276,27 @@ def main() -> None:
         if args.use_scene_world is not None:
             payload["use_scene_world"] = args.use_scene_world
         result = request_json("POST", f"{base_url}/viewport/shading", payload)
+    elif args.command == "forehead-camera":
+        payload = {"activate": args.activate, "timeout": args.timeout}
+        if args.offset is not None:
+            payload["offset"] = list(args.offset)
+        if args.lens is not None:
+            payload["lens"] = args.lens
+        if args.clip_start is not None:
+            payload["clip_start"] = args.clip_start
+        result = request_json("POST", f"{base_url}/camera/forehead/configure", payload)
+    elif args.command == "remove-forehead-camera":
+        result = request_json(
+            "POST",
+            f"{base_url}/camera/forehead/remove",
+            {"timeout": args.timeout},
+        )
+    elif args.command == "select-camera":
+        result = request_json(
+            "POST",
+            f"{base_url}/camera/select",
+            {"camera": args.camera, "timeout": args.timeout},
+        )
     elif args.command == "add-waypoint":
         payload = build_waypoint_marker_payload(args)
         route = "add" if "position" in payload else "add_from_cursor"
@@ -288,7 +349,11 @@ def main() -> None:
     elif args.command == "reset":
         result = request_json("POST", f"{base_url}/reset", {"clear_blender": args.clear_blender})
     elif args.command == "render-mp4":
-        result = request_json("POST", f"{base_url}/render/mp4", {"output": args.output})
+        result = request_json(
+            "POST",
+            f"{base_url}/render/mp4",
+            {"output": args.output, "camera": args.camera},
+        )
     else:
         raise AssertionError(args.command)
 
