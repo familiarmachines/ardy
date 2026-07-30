@@ -2,9 +2,9 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES.
 # SPDX-License-Identifier: Apache-2.0
 
-# Manage the two processes used by the ARDY interactive demo:
-#   1. A CPU-only LLM2Vec text-encoder service.
-#   2. The GPU-backed ARDY/Viser demo.
+# Manage the shared text encoder and one GPU-backed ARDY frontend:
+#   1. The Viser browser demo.
+#   2. The stateful live-motion API that drives Blender through an SSH tunnel.
 #
 # Processes are launched in their own sessions with nohup, so they survive an
 # SSH disconnect. Runtime state and logs are kept outside the repository.
@@ -32,6 +32,14 @@ ARDY_TEXT_PORT="${ARDY_TEXT_PORT:-9550}"
 ARDY_TEXT_DEVICE="${ARDY_TEXT_DEVICE:-cpu}"
 ARDY_TEXT_FP32="${ARDY_TEXT_FP32:-1}"
 ARDY_DEMO_COMPILE="${ARDY_DEMO_COMPILE:-0}"
+ARDY_LIVE_HOST="${ARDY_LIVE_HOST:-127.0.0.1}"
+ARDY_LIVE_PORT="${ARDY_LIVE_PORT:-8766}"
+ARDY_LIVE_BLENDER_URL="${ARDY_LIVE_BLENDER_URL:-http://127.0.0.1:9876}"
+ARDY_LIVE_OUTPUT_DIR="${ARDY_LIVE_OUTPUT_DIR:-${REPO_ROOT}/outputs/live_api}"
+ARDY_LIVE_RENDER_MODE="${ARDY_LIVE_RENDER_MODE:-skin}"
+ARDY_LIVE_DEVICE="${ARDY_LIVE_DEVICE:-}"
+ARDY_LIVE_MODEL="${ARDY_LIVE_MODEL:-}"
+ARDY_LIVE_LAZY_LOAD="${ARDY_LIVE_LAZY_LOAD:-0}"
 
 # The interactive demo currently fixes these values in scripts/run_demo.py.
 ARDY_DEMO_HOST="127.0.0.1"
@@ -39,26 +47,31 @@ ARDY_DEMO_PORT="2333"
 
 TEXT_PID_FILE="${ARDY_STATE_DIR}/text-encoder.pid"
 DEMO_PID_FILE="${ARDY_STATE_DIR}/demo.pid"
+LIVE_PID_FILE="${ARDY_STATE_DIR}/live.pid"
 TEXT_LOG="${ARDY_STATE_DIR}/text-encoder.log"
 DEMO_LOG="${ARDY_STATE_DIR}/demo.log"
+LIVE_LOG="${ARDY_STATE_DIR}/live.log"
 TEXT_URL="http://${ARDY_TEXT_HOST}:${ARDY_TEXT_PORT}/"
 DEMO_URL="http://${ARDY_DEMO_HOST}:${ARDY_DEMO_PORT}/"
+LIVE_URL="http://${ARDY_LIVE_HOST}:${ARDY_LIVE_PORT}/health"
 
 START_IN_PROGRESS=0
 STARTED_TEXT=0
 STARTED_DEMO=0
+STARTED_LIVE=0
 
 usage() {
     cat <<EOF
-Usage: $(basename "$0") COMMAND
+Usage: $(basename "$0") COMMAND [MODE]
 
 Commands:
-  start           Start the text encoder and ARDY demo in the background.
-  stop            Stop both managed processes.
-  restart         Stop and then start both managed processes.
-  status          Show process and health status.
-  logs [TARGET]   Follow logs for "text", "demo", or "all" (default).
-  help            Show this help.
+  start [MODE]       Start the text encoder and selected frontend. MODE is demo
+                     (default) or live. Starting one frontend stops the other.
+  stop               Stop all managed processes.
+  restart [MODE]     Stop all processes, then start MODE.
+  status             Show process and health status.
+  logs [TARGET]      Follow logs for "text", "demo", "live", or "all" (default).
+  help               Show this help.
 
 Environment overrides:
   ARDY_PYTHON           Python executable (default: ${ARDY_PYTHON})
@@ -68,6 +81,16 @@ Environment overrides:
   ARDY_TEXT_DEVICE      Text encoder device (default: ${ARDY_TEXT_DEVICE})
   ARDY_TEXT_FP32        Set to 1 for fp32 or 0 for bfloat16 (default: ${ARDY_TEXT_FP32})
   ARDY_DEMO_COMPILE     Set to 1 to enable the demo's default compilation mode (default: ${ARDY_DEMO_COMPILE})
+  ARDY_LIVE_BLENDER_URL Blender control URL reached through reverse SSH forwarding
+                        (default: ${ARDY_LIVE_BLENDER_URL})
+  ARDY_LIVE_OUTPUT_DIR  Remote generated-motion directory
+                        (default: ${ARDY_LIVE_OUTPUT_DIR})
+  ARDY_LIVE_DEVICE      Device override such as cuda:0 (default: automatic)
+  ARDY_LIVE_MODEL       Model nickname or full name (default: API default)
+  ARDY_LIVE_RENDER_MODE Blender avatar mode: auto, skin, skeleton, or both
+                        (default: ${ARDY_LIVE_RENDER_MODE})
+  ARDY_LIVE_LAZY_LOAD   Set to 1 to defer model loading until the first prompt
+                        (default: ${ARDY_LIVE_LAZY_LOAD})
 EOF
 }
 
@@ -90,6 +113,7 @@ component_pid_file() {
     case "$1" in
         text) printf '%s\n' "${TEXT_PID_FILE}" ;;
         demo) printf '%s\n' "${DEMO_PID_FILE}" ;;
+        live) printf '%s\n' "${LIVE_PID_FILE}" ;;
         *) return 1 ;;
     esac
 }
@@ -98,6 +122,7 @@ component_log_file() {
     case "$1" in
         text) printf '%s\n' "${TEXT_LOG}" ;;
         demo) printf '%s\n' "${DEMO_LOG}" ;;
+        live) printf '%s\n' "${LIVE_LOG}" ;;
         *) return 1 ;;
     esac
 }
@@ -106,6 +131,7 @@ component_command_marker() {
     case "$1" in
         text) printf '%s\n' 'scripts/run_text_encoder_server.py' ;;
         demo) printf '%s\n' 'scripts/run_demo.py' ;;
+        live) printf '%s\n' 'scripts/run_live_motion_api.py' ;;
         *) return 1 ;;
     esac
 }
@@ -302,6 +328,71 @@ start_demo() {
     log "ARDY demo is ready at ${DEMO_URL}"
 }
 
+start_live() {
+    local pid
+    local -a command
+
+    if component_is_running live; then
+        pid="$(read_component_pid live)"
+        log "ARDY live-motion API is already running (PID ${pid})."
+        wait_for_component live "${LIVE_URL}" || die "Running live-motion API did not become ready."
+        log "ARDY live-motion API is ready at ${LIVE_URL}"
+        return 0
+    fi
+
+    rm -f -- "${LIVE_PID_FILE}"
+    if port_is_open "${ARDY_LIVE_HOST}" "${ARDY_LIVE_PORT}"; then
+        die "Port ${ARDY_LIVE_PORT} is occupied by a process not managed by this script."
+    fi
+
+    command=(
+        env
+        "PYTHONUNBUFFERED=1"
+        "HF_ENABLE_PARALLEL_LOADING=YES"
+        "TEXT_ENCODER_MODE=api"
+        "TEXT_ENCODER_URL=${TEXT_URL}"
+        "${ARDY_PYTHON}"
+        "${REPO_ROOT}/scripts/run_live_motion_api.py"
+        --host "${ARDY_LIVE_HOST}"
+        --port "${ARDY_LIVE_PORT}"
+        --blender-url "${ARDY_LIVE_BLENDER_URL}"
+        --output-dir "${ARDY_LIVE_OUTPUT_DIR}"
+        --render-mode "${ARDY_LIVE_RENDER_MODE}"
+        --text-encoder-mode api
+        --text-encoder-url "${TEXT_URL}"
+    )
+    if [[ -n "${ARDY_LIVE_DEVICE}" ]]; then
+        command+=(--device "${ARDY_LIVE_DEVICE}")
+    fi
+    if [[ -n "${ARDY_LIVE_MODEL}" ]]; then
+        command+=(--model "${ARDY_LIVE_MODEL}")
+    fi
+    if [[ "${ARDY_LIVE_LAZY_LOAD}" == "1" ]]; then
+        command+=(--lazy-load)
+    fi
+
+    printf '\n=== Starting ARDY live-motion API at %s ===\n' "$(date --iso-8601=seconds)" >>"${LIVE_LOG}"
+    nohup setsid "${command[@]}" >>"${LIVE_LOG}" 2>&1 </dev/null &
+    pid=$!
+    write_pid_file "${LIVE_PID_FILE}" "${pid}"
+    STARTED_LIVE=1
+
+    sleep 1
+    component_is_running live || {
+        tail_failure_log live
+        die "ARDY live-motion API failed to launch."
+    }
+
+    log "Waiting for the live-motion API (PID ${pid}); first launch may load model weights."
+    wait_for_component live "${LIVE_URL}" || die "ARDY live-motion API did not become ready."
+    log "ARDY live-motion API is ready at ${LIVE_URL}"
+    if live_blender_is_connected; then
+        log "Live Blender is connected at ${ARDY_LIVE_BLENDER_URL}"
+    else
+        log "Live Blender is not connected yet; establish the reverse SSH tunnel before prompting."
+    fi
+}
+
 signal_component_group() {
     local pid="$1"
     local signal="$2"
@@ -351,6 +442,9 @@ cleanup_failed_start() {
 
     if ((exit_code != 0 && START_IN_PROGRESS == 1)); then
         log "Start failed; cleaning up processes launched by this attempt." >&2
+        if ((STARTED_LIVE == 1)); then
+            stop_component live "ARDY live-motion API" || true
+        fi
         if ((STARTED_DEMO == 1)); then
             stop_component demo "ARDY demo" || true
         fi
@@ -374,36 +468,70 @@ preflight() {
     command -v setsid >/dev/null 2>&1 || die "setsid is required."
     require_positive_integer ARDY_STARTUP_TIMEOUT "${ARDY_STARTUP_TIMEOUT}"
     require_positive_integer ARDY_STOP_TIMEOUT "${ARDY_STOP_TIMEOUT}"
+    require_positive_integer ARDY_LIVE_PORT "${ARDY_LIVE_PORT}"
     [[ "${ARDY_TEXT_FP32}" == "0" || "${ARDY_TEXT_FP32}" == "1" ]] ||
         die "ARDY_TEXT_FP32 must be 0 or 1."
     [[ "${ARDY_DEMO_COMPILE}" == "0" || "${ARDY_DEMO_COMPILE}" == "1" ]] ||
         die "ARDY_DEMO_COMPILE must be 0 or 1."
+    [[ "${ARDY_LIVE_LAZY_LOAD}" == "0" || "${ARDY_LIVE_LAZY_LOAD}" == "1" ]] ||
+        die "ARDY_LIVE_LAZY_LOAD must be 0 or 1."
+    case "${ARDY_LIVE_RENDER_MODE}" in
+        auto|skin|skeleton|both) ;;
+        *) die "ARDY_LIVE_RENDER_MODE must be auto, skin, skeleton, or both." ;;
+    esac
 
     mkdir -p -- "${ARDY_STATE_DIR}"
     chmod 700 -- "${ARDY_STATE_DIR}"
-    touch -- "${TEXT_LOG}" "${DEMO_LOG}"
-    chmod 600 -- "${TEXT_LOG}" "${DEMO_LOG}"
+    touch -- "${TEXT_LOG}" "${DEMO_LOG}" "${LIVE_LOG}"
+    chmod 600 -- "${TEXT_LOG}" "${DEMO_LOG}" "${LIVE_LOG}"
 
     "${ARDY_PYTHON}" -c \
         'import ardy, gradio, motion_correction, torch, transformers, viser' ||
         die "ARDY dependencies are not importable with ${ARDY_PYTHON}."
 }
 
-start_all() {
+live_blender_is_connected() {
+    curl --fail --silent --show-error --max-time 3 "${LIVE_URL}" 2>/dev/null |
+        "${ARDY_PYTHON}" -c \
+            'import json, sys; b=json.load(sys.stdin).get("blender", {}); raise SystemExit(b.get("status") != "ok" or b.get("capabilities", {}).get("motion_file_transfer") != 1)'
+}
+
+start_mode() {
+    local mode="$1"
+
     preflight
     START_IN_PROGRESS=1
-    start_text_encoder
-    start_demo
+    case "${mode}" in
+        demo)
+            stop_component live "ARDY live-motion API"
+            start_text_encoder
+            start_demo
+            ;;
+        live)
+            stop_component demo "ARDY demo"
+            start_text_encoder
+            start_live
+            ;;
+        *)
+            die 'MODE must be "demo" or "live".'
+            ;;
+    esac
     START_IN_PROGRESS=0
 
-    log "Both services are running."
-    log "From a remote machine, use:"
-    printf '  ssh -N -L 8080:127.0.0.1:%s user@server\n' "${ARDY_DEMO_PORT}"
-    printf '  Then open http://localhost:8080/\n'
+    log "Text encoder and ${mode} frontend are running."
+    if [[ "${mode}" == "demo" ]]; then
+        log "Forward the browser demo with:"
+        printf '  ssh -N -L 8080:127.0.0.1:%s user@server\n' "${ARDY_DEMO_PORT}"
+    else
+        log "Forward the API and reverse-forward local Blender with:"
+        printf '  ssh -N -L %s:127.0.0.1:%s -R 9876:127.0.0.1:9876 user@server\n' \
+            "${ARDY_LIVE_PORT}" "${ARDY_LIVE_PORT}"
+    fi
 }
 
 stop_all() {
     mkdir -p -- "${ARDY_STATE_DIR}"
+    stop_component live "ARDY live-motion API"
     stop_component demo "ARDY demo"
     stop_component text "text encoder"
 }
@@ -429,24 +557,35 @@ component_status() {
 }
 
 show_status() {
-    local result=0
+    local text_running=0
+    local demo_running=0
+    local live_running=0
 
-    component_status text "Text encoder" "${TEXT_URL}" || result=1
-    component_status demo "ARDY demo" "${DEMO_URL}" || result=1
+    component_status text "Text encoder" "${TEXT_URL}" && text_running=1
+    component_status demo "ARDY demo" "${DEMO_URL}" && demo_running=1
+    component_status live "ARDY live API" "${LIVE_URL}" && live_running=1
+    if ((live_running == 1)); then
+        if live_blender_is_connected; then
+            printf '%-14s CONNECTED %s\n' "Blender tunnel" "${ARDY_LIVE_BLENDER_URL}"
+        else
+            printf '%-14s DISCONNECTED %s\n' "Blender tunnel" "${ARDY_LIVE_BLENDER_URL}"
+        fi
+    fi
     printf 'Logs: %s\n' "${ARDY_STATE_DIR}"
-    return "${result}"
+    ((text_running == 1 && (demo_running == 1 || live_running == 1)))
 }
 
 follow_logs() {
     local target="${1:-all}"
 
     mkdir -p -- "${ARDY_STATE_DIR}"
-    touch -- "${TEXT_LOG}" "${DEMO_LOG}"
+    touch -- "${TEXT_LOG}" "${DEMO_LOG}" "${LIVE_LOG}"
     case "${target}" in
         text) tail -n 100 -F "${TEXT_LOG}" ;;
         demo) tail -n 100 -F "${DEMO_LOG}" ;;
-        all) tail -n 100 -F "${TEXT_LOG}" "${DEMO_LOG}" ;;
-        *) die 'logs target must be "text", "demo", or "all".' ;;
+        live) tail -n 100 -F "${LIVE_LOG}" ;;
+        all) tail -n 100 -F "${TEXT_LOG}" "${DEMO_LOG}" "${LIVE_LOG}" ;;
+        *) die 'logs target must be "text", "demo", "live", or "all".' ;;
     esac
 }
 
@@ -455,17 +594,17 @@ trap cleanup_failed_start EXIT
 command="${1:-help}"
 case "${command}" in
     start)
-        [[ $# -eq 1 ]] || die "start takes no additional arguments."
-        start_all
+        [[ $# -le 2 ]] || die "start accepts at most one MODE."
+        start_mode "${2:-demo}"
         ;;
     stop)
         [[ $# -eq 1 ]] || die "stop takes no additional arguments."
         stop_all
         ;;
     restart)
-        [[ $# -eq 1 ]] || die "restart takes no additional arguments."
+        [[ $# -le 2 ]] || die "restart accepts at most one MODE."
         stop_all
-        start_all
+        start_mode "${2:-demo}"
         ;;
     status)
         [[ $# -eq 1 ]] || die "status takes no additional arguments."

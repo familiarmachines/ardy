@@ -109,11 +109,13 @@ If you plan to be frequently re-launching the demo, it can be helpful to launch 
 python scripts/run_text_encoder_server.py
 ```
 
-For a detached server that survives SSH disconnects, use the management script:
+For a detached server that survives SSH disconnects, use the management script. Browser-demo mode
+remains the default:
 
 ```bash
 conda activate ardy
 scripts/ardy_server.sh start
+# Equivalent: scripts/ardy_server.sh start demo
 scripts/ardy_server.sh status
 scripts/ardy_server.sh logs
 scripts/ardy_server.sh stop
@@ -123,7 +125,9 @@ The script requires Linux (`nohup`, `setsid`, and `/proc`) and an activated Pyth
 alternatively, set `ARDY_PYTHON` to the environment's Python executable. It runs the text encoder
 on CPU, runs ARDY on the GPU, waits for both services to become healthy, and writes logs under
 `~/.local/state/ardy-server/`. Compilation is disabled by default; set `ARDY_DEMO_COMPILE=1` to use
-the demo's default compilation mode. To access the server through SSH from another machine:
+the demo's default compilation mode. Starting `demo` automatically stops a managed `live` frontend,
+and starting `live` stops a managed `demo` frontend so both do not load separate motion models on
+the same GPU. To access the browser demo through SSH from another machine:
 
 ```bash
 ssh -N -L 8080:127.0.0.1:2333 user@server
@@ -592,12 +596,83 @@ The same Hugging Face token requirements from setup apply: prompt generation nee
 gated Meta Llama text encoder unless you run a compatible text-encoder service and start the API
 with `--text-encoder-mode api --text-encoder-url ...`.
 
+#### Remote ARDY GPU With Local Live Blender
+
+The stateful motion API can run on a remote GPU while Blender stays open on the local workstation.
+Both HTTP services remain bound to loopback. A bidirectional SSH tunnel carries Codex requests to
+the remote API and carries the remote API's Blender callbacks back to the local session:
+
+```text
+Codex/client -> local :8766 -> remote ARDY live API :8766
+Remote ARDY  -> remote :9876 -> local Blender API :9876
+```
+
+Start or verify the persistent local Blender session first:
+
+```bash
+scripts/start_scene4_live_blender.sh
+curl --fail http://127.0.0.1:9876/health
+```
+
+After pulling a version that changes `blender_live_server.py`, restart Blender once so the running
+process loads the new server code. Routine motion prompts continue to reuse that Blender process.
+
+On the local workstation, start the managed tunnel:
+
+```bash
+export ARDY_REMOTE_HOST=azureuser@51.8.106.21
+export ARDY_SSH_KEY="$HOME/Desktop/cwong.pem"
+scripts/ardy_live_tunnel.sh start
+```
+
+On the remote GPU host, pull the repository and start live mode from the ARDY environment:
+
+```bash
+cd ~/Projects/familiar/ardy
+git switch main
+git pull --ff-only origin main
+conda activate ardy
+export ARDY_LIVE_DEVICE=cuda:0
+scripts/ardy_server.sh start live
+scripts/ardy_server.sh status
+```
+
+The remote manager starts the CPU text encoder on `9550` and the GPU live-motion API on `8766`.
+It does not start the Viser demo in live mode. To defer model loading until the first request, set
+`ARDY_LIVE_LAZY_LOAD=1`.
+
+Back on the local workstation, verify both tunnel directions and submit prompts normally:
+
+```bash
+scripts/ardy_live_tunnel.sh status
+python scripts/live_session_client.py health
+python scripts/live_session_client.py prompt \
+  "A person walks with a confident normal gait, upright posture, steady steps, and natural arm swing." \
+  --duration 6 \
+  --render-mode skin
+```
+
+Generated `.npz` data is checksum-verified and transferred inline to
+`outputs/live_api/received/` on the Blender workstation. No shared filesystem is required. The
+remote API commits motion history only after Blender accepts a segment, so a failed callback does
+not advance continuity state.
+
+Stop the components from their respective machines:
+
+```bash
+# Local workstation
+scripts/ardy_live_tunnel.sh stop
+
+# Remote GPU host
+scripts/ardy_server.sh stop
+```
+
 Equivalent raw HTTP request:
 
 ```bash
-curl -X POST http://127.0.0.1:8765/generate \
+curl -X POST http://127.0.0.1:8766/prompt \
   -H 'Content-Type: application/json' \
-  -d '{"prompt":"A person jumps backwards.","duration":4,"render":true}'
+  -d '{"prompt":"A person jumps backwards.","duration":4,"render_mode":"skin"}'
 ```
 
 ---

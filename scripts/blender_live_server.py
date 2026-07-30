@@ -30,6 +30,7 @@ from forehead_camera import (  # noqa: E402
     build_head_transform_track,
     transform_track,
 )
+from motion_transport import materialize_motion_file  # noqa: E402
 from render_motion_blender import (  # noqa: E402
     ANIMATED_MESHES,
     PARENTS_BY_JOINT_COUNT,
@@ -55,6 +56,7 @@ from render_motion_blender import (  # noqa: E402
 
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 9876
+MOTION_CACHE_DIR = SCRIPT_DIR.parent / "outputs" / "live_api" / "received"
 AVATAR_OBJECT_PROP = "ardy_live_avatar_object"
 CAMERA_OBJECT_PROP = "ardy_live_camera_object"
 DEFAULT_CAMERA_PROP = "ardy_default_camera_object"
@@ -244,6 +246,9 @@ def json_state() -> dict[str, Any]:
     scene = bpy.context.scene
     return {
         "status": "ok",
+        "capabilities": {
+            "motion_file_transfer": 1,
+        },
         "usd_path": STATE.usd_path,
         "avatar_position": STATE.avatar_position,
         "avatar_heading": STATE.avatar_heading,
@@ -1123,7 +1128,11 @@ def show_default_avatar(_payload: dict[str, Any] | None = None) -> dict[str, Any
 
 
 def load_motion_into_scene(payload: dict[str, Any]) -> dict[str, Any]:
-    motion_path = Path(str(payload.get("motion_path", ""))).expanduser().resolve()
+    motion_file = payload.get("motion_file")
+    if motion_file is not None:
+        motion_path = materialize_motion_file(motion_file, MOTION_CACHE_DIR)
+    else:
+        motion_path = Path(str(payload.get("motion_path", ""))).expanduser().resolve()
     if not motion_path.exists():
         raise FileNotFoundError(f"Motion file not found: {motion_path}")
 

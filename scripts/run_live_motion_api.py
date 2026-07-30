@@ -27,6 +27,7 @@ from ardy.model.loading import get_env_var
 from ardy.skeleton import SOMASkeleton30
 from ardy.tools import seed_everything, to_numpy
 
+from motion_transport import encode_motion_file  # noqa: E402
 from run_motion_api import (  # noqa: E402
     APIConfig,
     MotionGenerator,
@@ -292,6 +293,18 @@ class LiveMotionSession:
 
         with self._lock:
             start = time.time()
+            blender_health = self._try_blender_health()
+            if blender_health.get("status") != "ok":
+                raise RuntimeError(
+                    f"Live Blender is unavailable at {self.config.blender_url}: "
+                    f"{blender_health.get('error', 'health check failed')}"
+                )
+            if blender_health.get("capabilities", {}).get("motion_file_transfer") != 1:
+                raise RuntimeError(
+                    "Live Blender does not support remote motion transfer. "
+                    "Restart Blender with the current scripts/blender_live_server.py."
+                )
+
             model_name = str(payload.get("model") or self.config.default_model)
             model = self.generator._load_model(model_name)
             if payload.get("seed") is not None:
@@ -317,7 +330,7 @@ class LiveMotionSession:
                 else None
             )
 
-            new_windows = self._generate_windows(
+            new_windows, next_motion_tensor = self._generate_windows(
                 model=model,
                 prompt=prompt,
                 text_feat=text_feat,
@@ -349,11 +362,32 @@ class LiveMotionSession:
             motion_path.parent.mkdir(parents=True, exist_ok=True)
             save_motion_npz(motion_path, select_sample(visible_output_np, 0, 1), fps, prompt)
 
+            continuity_delta = None
+            if previous_end_motion is not None:
+                prev_output = model.motion_rep.inverse(previous_end_motion, is_normalized=True)
+                prev_root = prev_output["root_positions"][0, -1].detach().cpu().numpy()
+                visible_root = visible_output["root_positions"][0, 0].detach().cpu().numpy()
+                continuity_delta = float(np.linalg.norm(visible_root - prev_root))
+
+            waypoint_errors = self._measure_waypoint_errors(
+                visible_output=visible_output,
+                waypoints=waypoints,
+                visible_frame_offset=1 if previous_end_motion is not None else 0,
+            )
+            next_waypoints = [
+                {
+                    "frame": waypoint["frame"],
+                    "position": waypoint["position"],
+                    **({"heading": waypoint["heading"]} if waypoint.get("heading") is not None else {}),
+                }
+                for waypoint in waypoints
+            ]
+
             vertical_offset = float(self.avatar_position_blender[2])
             blender = self._post_blender(
                 "/motion/load",
                 {
-                    "motion_path": str(motion_path),
+                    "motion_file": encode_motion_file(motion_path),
                     "width": int(payload.get("render_width", self.config.render_width)),
                     "height": int(payload.get("render_height", self.config.render_height)),
                     "render_mode": str(payload.get("render_mode", self.config.render_mode)),
@@ -367,35 +401,17 @@ class LiveMotionSession:
                 timeout=float(payload.get("blender_timeout", 600.0)),
             )
 
+            # Commit continuity state only after Blender has accepted the segment.
+            self.motion_tensor = next_motion_tensor
+            self.segment_index += 1
+            self.last_prompt = prompt
+            self.last_motion_path = str(motion_path)
+            self.last_waypoints = next_waypoints
+
             render_response = None
             render_output = payload.get("render_mp4")
             if render_output:
                 render_response = self._post_blender("/render/mp4", {"output": str(render_output)}, timeout=1200.0)
-
-            continuity_delta = None
-            if previous_end_motion is not None:
-                prev_output = model.motion_rep.inverse(previous_end_motion, is_normalized=True)
-                prev_root = prev_output["root_positions"][0, -1].detach().cpu().numpy()
-                visible_root = visible_output["root_positions"][0, 0].detach().cpu().numpy()
-                continuity_delta = float(np.linalg.norm(visible_root - prev_root))
-
-            waypoint_errors = self._measure_waypoint_errors(
-                visible_output=visible_output,
-                waypoints=waypoints,
-                visible_frame_offset=1 if previous_end_motion is not None else 0,
-            )
-
-            self.segment_index += 1
-            self.last_prompt = prompt
-            self.last_motion_path = str(motion_path)
-            self.last_waypoints = [
-                {
-                    "frame": waypoint["frame"],
-                    "position": waypoint["position"],
-                    **({"heading": waypoint["heading"]} if waypoint.get("heading") is not None else {}),
-                }
-                for waypoint in waypoints
-            ]
 
             return {
                 "status": "ok",
@@ -417,15 +433,20 @@ class LiveMotionSession:
                 "elapsed_seconds": round(time.time() - start, 3),
             }
 
-    def _history_tail(self, model, history_frames: int) -> torch.Tensor | None:
-        if self.motion_tensor is None or self.motion_tensor.shape[1] == 0:
+    @staticmethod
+    def _history_tail(
+        motion_tensor: torch.Tensor | None,
+        model,
+        history_frames: int,
+    ) -> torch.Tensor | None:
+        if motion_tensor is None or motion_tensor.shape[1] == 0:
             return None
         patch = int(model.num_frames_per_token)
-        usable = min(int(self.motion_tensor.shape[1]), int(history_frames))
+        usable = min(int(motion_tensor.shape[1]), int(history_frames))
         usable = (usable // patch) * patch
         if usable < patch:
             return None
-        return self.motion_tensor[:, -usable:].detach().clone()
+        return motion_tensor[:, -usable:].detach().clone()
 
     def _generate_windows(
         self,
@@ -439,17 +460,18 @@ class LiveMotionSession:
         history_frames: int,
         continue_from_history: bool,
         waypoints: list[dict[str, Any]],
-    ) -> list[torch.Tensor]:
+    ) -> tuple[list[torch.Tensor], torch.Tensor]:
         remaining = requested_new_frames
         gen_horizon_len = int(model.gen_horizon_len)
         num_frames_per_token = int(model.num_frames_per_token)
         init_translation = blender_position_to_ardy_translation(self.avatar_position_blender).to(self.config.device)
         init_heading = torch.tensor([self.init_heading], dtype=torch.float32, device=self.config.device)
         new_windows: list[torch.Tensor] = []
+        working_motion = self.motion_tensor if continue_from_history else None
         generated_so_far = 0
 
         while remaining > 0:
-            history_tail = self._history_tail(model, history_frames) if continue_from_history else None
+            history_tail = self._history_tail(working_motion, model, history_frames)
             if history_tail is not None:
                 history_len = int(history_tail.shape[1])
                 total_frames = history_len + gen_horizon_len
@@ -500,13 +522,13 @@ class LiveMotionSession:
 
             take = min(remaining, int(new_window.shape[1]))
             taken = new_window[:, :take].detach()
-            if self.motion_tensor is None or not continue_from_history:
-                self.motion_tensor = taken.clone()
+            if working_motion is None:
+                working_motion = taken.clone()
                 continue_from_history = True
             else:
-                self.motion_tensor = torch.cat([self.motion_tensor, taken], dim=1)
-                if self.motion_tensor.shape[1] > self.max_stored_frames:
-                    self.motion_tensor = self.motion_tensor[:, -self.max_stored_frames :].detach()
+                working_motion = torch.cat([working_motion, taken], dim=1)
+                if working_motion.shape[1] > self.max_stored_frames:
+                    working_motion = working_motion[:, -self.max_stored_frames :].detach()
 
             new_windows.append(taken)
             remaining -= take
@@ -514,7 +536,8 @@ class LiveMotionSession:
 
         if not new_windows:
             raise RuntimeError(f"No motion frames were generated for prompt: {prompt}")
-        return new_windows
+        assert working_motion is not None
+        return new_windows, working_motion
 
     def _parse_waypoints(self, raw_waypoints: Any, requested_new_frames: int, fps: float) -> list[dict[str, Any]]:
         if raw_waypoints is None:

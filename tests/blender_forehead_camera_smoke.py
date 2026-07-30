@@ -17,6 +17,7 @@ import bpy  # noqa: E402
 
 import blender_live_server as live  # noqa: E402
 from forehead_camera import HeadTransformTrack  # noqa: E402
+from motion_transport import encode_motion_file  # noqa: E402
 
 
 def assert_close(actual: object, expected: object, *, atol: float = 1e-5) -> None:
@@ -31,6 +32,7 @@ live.STATE.forehead_camera_enabled = True
 live.STATE.forehead_camera_offset = [0.0, 0.16, 0.08]
 live.STATE.current_scale = 1.0
 live.configure_forehead_camera()
+assert live.json_state()["capabilities"]["motion_file_transfer"] == 1
 
 rotations = np.asarray(
     [
@@ -96,13 +98,17 @@ with tempfile.TemporaryDirectory(prefix="ardy_forehead_camera_test_") as tmpdir:
         fps=np.asarray(20.0),
         text=np.asarray("Forehead camera smoke test"),
     )
+    live.MOTION_CACHE_DIR = Path(tmpdir) / "received"
     live.load_motion_into_scene(
         {
-            "motion_path": str(motion_path),
+            "motion_file": encode_motion_file(motion_path),
             "render_mode": "skin",
             "play": False,
         }
     )
+    received_motion_path = Path(str(live.STATE.current_motion_path))
+    assert received_motion_path.parent == live.MOTION_CACHE_DIR
+    assert received_motion_path.read_bytes() == motion_path.read_bytes()
 
 scene.frame_set(1)
 first_motion_location = camera.matrix_world.translation.copy()
