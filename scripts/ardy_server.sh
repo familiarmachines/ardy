@@ -20,6 +20,8 @@ elif [[ -n "${CONDA_PREFIX:-}" && -x "${CONDA_PREFIX}/bin/python" ]]; then
     ARDY_PYTHON="${CONDA_PREFIX}/bin/python"
 elif command -v python >/dev/null 2>&1; then
     ARDY_PYTHON="$(command -v python)"
+elif command -v python3 >/dev/null 2>&1; then
+    ARDY_PYTHON="$(command -v python3)"
 else
     ARDY_PYTHON="python"
 fi
@@ -493,7 +495,8 @@ preflight() {
 live_blender_is_connected() {
     curl --fail --silent --show-error --max-time 3 "${LIVE_URL}" 2>/dev/null |
         "${ARDY_PYTHON}" -c \
-            'import json, sys; b=json.load(sys.stdin).get("blender", {}); raise SystemExit(b.get("status") != "ok" or b.get("capabilities", {}).get("motion_file_transfer") != 1)'
+            'import json, sys; b=json.load(sys.stdin).get("blender", {}); raise SystemExit(b.get("status") != "ok" or b.get("capabilities", {}).get("motion_file_transfer") != 1)' \
+            2>/dev/null
 }
 
 start_mode() {
