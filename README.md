@@ -109,6 +109,28 @@ If you plan to be frequently re-launching the demo, it can be helpful to launch 
 python scripts/run_text_encoder_server.py
 ```
 
+For a detached server that survives SSH disconnects, use the management script:
+
+```bash
+conda activate ardy
+scripts/ardy_server.sh start
+scripts/ardy_server.sh status
+scripts/ardy_server.sh logs
+scripts/ardy_server.sh stop
+```
+
+The script requires Linux (`nohup`, `setsid`, and `/proc`) and an activated Python environment;
+alternatively, set `ARDY_PYTHON` to the environment's Python executable. It runs the text encoder
+on CPU, runs ARDY on the GPU, waits for both services to become healthy, and writes logs under
+`~/.local/state/ardy-server/`. Compilation is disabled by default; set `ARDY_DEMO_COMPILE=1` to use
+the demo's default compilation mode. To access the server through SSH from another machine:
+
+```bash
+ssh -N -L 8080:127.0.0.1:2333 user@server
+```
+
+Then open `http://localhost:8080/`.
+
 ### Quick Start
 - **Open the UI**: In your browser, go to `http://localhost:2333`. You can use Left-drag to rotate, Right-drag to pan, and Scroll to zoom to control the camera with mouse.
 - **Load a model**: Choose a checkpoint from the **Model Directory** dropdown in the **Model** tab and click **Load Model**. The first load may take a few minutes if TensorRT compilation is enabled. A default checkpoint is loaded if no checkpoint is manually selected.
