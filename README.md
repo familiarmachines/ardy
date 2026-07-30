@@ -277,6 +277,329 @@ Most useful flags:
 
 > Tip: if you generate repeatedly, start the standalone text-encoder service in the background first (`python scripts/run_text_encoder_server.py`) so each run connects to it instead of loading the LLM2Vec model in-process every time.
 
+### HTTP API + Blender Rendering
+
+For repeated Codex-driven generation, [`scripts/run_motion_api.py`](scripts/run_motion_api.py) keeps an
+ARDY model loaded behind a small JSON API. It can optionally call Blender through
+[`scripts/render_motion_blender.py`](scripts/render_motion_blender.py) and return both `.npz` and `.mp4`
+paths. Blender rendering defaults to `--render-mode auto`, which uses the packaged skinned human mesh
+when the motion file contains compatible joint rotations and falls back to a skeleton otherwise.
+
+```bash
+# Terminal 1: start the long-running API.
+python scripts/run_motion_api.py --render-by-default
+
+# Terminal 2: submit a prompt and render it in Blender.
+python scripts/request_motion.py \
+  "A person walks forward, turns left, then waves with their right hand." \
+  --duration 6 \
+  --seed 42 \
+  --render \
+  --render-mode skin \
+  --output walk_wave
+```
+
+The API listens on `http://127.0.0.1:8765` by default. The request above writes
+`outputs/api/walk_wave.npz` and `outputs/api/walk_wave.mp4`.
+
+To run an existing motion in a visible Blender session without exporting a video, omit
+`--background` and use `--live-only --play`:
+
+```bash
+~/Projects/blender/blender --python scripts/render_motion_blender.py -- \
+  outputs/api/walk_wave.npz \
+  --render-mode skin \
+  --live-only \
+  --play \
+  --loop \
+  --save-blend outputs/api/walk_wave_live.blend
+```
+
+To export MP4 as well, omit `--live-only` and add `--output outputs/api/walk_wave_live.mp4`.
+
+### Codex Skill
+
+The repository includes a Codex skill for reproducing the Scene4 Blender development session:
+`.agents/skills/launch-ardy-blender`. Codex discovers repository skills automatically when started
+anywhere inside this Git checkout, so no installation step is required. Run `/skills` to confirm it
+is available, then invoke it explicitly:
+
+```text
+Use $launch-ardy-blender to start Blender.
+```
+
+To make the skill available when Codex starts outside this repository, install it for the current
+user with a symlink. Run these commands from anywhere inside the ARDY checkout:
+
+```bash
+repo_root="$(git rev-parse --show-toplevel)"
+mkdir -p "$HOME/.agents/skills"
+ln -s "$repo_root/.agents/skills/launch-ardy-blender" \
+  "$HOME/.agents/skills/launch-ardy-blender"
+```
+
+The symlink keeps the installed skill synchronized with repository updates. If a different copy
+already exists at that destination, remove or rename it before creating the symlink. Set
+`ARDY_REPO` to the checkout path when using a copied skill instead:
+
+```bash
+export ARDY_REPO=/absolute/path/to/ardy
+```
+
+Codex normally detects skill changes automatically. Restart Codex if a newly installed or updated
+skill does not appear in `/skills`.
+
+### Persistent Live Blender Session
+
+For USD-scene workflows, keep Blender running and update the same avatar in-place instead of
+restarting Blender for each prompt. [`scripts/blender_live_server.py`](scripts/blender_live_server.py)
+runs inside Blender and exposes a localhost control API. [`scripts/run_live_motion_api.py`](scripts/run_live_motion_api.py)
+keeps ARDY loaded, remembers prior motion history, and sends each generated segment to the existing
+Blender process.
+
+```bash
+# Terminal 1: start Blender once with the live control server.
+~/Projects/blender/blender --python scripts/blender_live_server.py -- --port 9876
+
+# Optional scene4 dev startup: starts Blender with the textured USD wrapper, dimmed scene lights,
+# Rendered viewport shading, a visible skinned avatar, and default plus forehead cameras.
+scripts/start_scene4_live_blender.sh
+
+# Terminal 2: start the stateful ARDY session API.
+python scripts/run_live_motion_api.py \
+  --blender-url http://127.0.0.1:9876 \
+  --render-mode skin
+
+# Terminal 3: load a USD scene and place the avatar in Blender coordinates.
+python scripts/live_session_client.py load-usd path/to/scene.usd --clear
+python scripts/live_session_client.py place --position 1.0 2.0 0.0 --heading 0.0
+
+# First prompt: plays once and holds on the final frame by default.
+python scripts/live_session_client.py prompt \
+  "Walk in a semicircle and sit down on the floor cross-legged." \
+  --duration 12 \
+  --output semicircle_sit_cross_legged
+
+# Next prompt: continues from the previous end pose/root position.
+python scripts/live_session_client.py prompt \
+  "Stand up and walk toward the doorway." \
+  --duration 8 \
+  --output stand_and_walk
+
+# Waypoint prompt: root follows Blender ground-plane X/Y targets at given frames.
+python scripts/live_session_client.py prompt \
+  "Walk naturally along the marked route." \
+  --duration 6 \
+  --cfg-weight 2.0 2.0 \
+  --waypoint 40 0.6 0.3 \
+  --waypoint 80 0.2 0.1 \
+  --waypoint 119 0.0 0.0 \
+  --show-root-path \
+  --output waypoint_walk
+```
+
+The Scene4 launcher also creates `ardy_forehead_camera`, mounted to ARDY's animated `Head` joint.
+The preferred third-person camera remains active at startup. Switch the live camera view without
+restarting Blender:
+
+```bash
+# Select the forehead camera using its default 18 mm lens.
+python scripts/live_session_client.py select-camera forehead
+
+# Adjust the head-local mount as lateral, forward, and up offsets in meters.
+python scripts/live_session_client.py forehead-camera \
+  --offset 0.0 0.16 0.08 \
+  --lens 18 \
+  --clip-start 0.02 \
+  --activate
+
+# Return to the preferred scene camera.
+python scripts/live_session_client.py select-camera scene
+
+# Render from the forehead camera without changing the live active camera.
+python scripts/live_session_client.py render-mp4 \
+  outputs/live_api/forehead_view.mp4 \
+  --camera forehead
+
+# Render from the preferred scene camera.
+python scripts/live_session_client.py render-mp4 \
+  outputs/live_api/scene_view.mp4 \
+  --camera scene
+```
+
+The forehead camera follows the full head position and orientation, including pitch, yaw, and roll.
+Its mount survives avatar replacement, so each new motion updates the same camera in the persistent
+Blender session. The `/health` response reports its world transform, mount settings, tracked frame
+count, and whether it is active.
+
+The scene4 launcher expects the local scene asset at `scene4/scene4/main.usd`. The source `scene4/`
+asset folder is intentionally ignored by git because it is large. For private team development, the
+asset pack lives in the shared Google Drive folder recorded by `assets/scene4.json`. Install and
+configure `rclone` once:
+
+```bash
+curl https://rclone.org/install.sh | sudo bash
+rclone config
+```
+
+Create a Google Drive remote named `ardy-scene4`, enable advanced config, and set
+`root_folder_id` to:
+
+```text
+1jeaOb4C-koKg0QY1ii-6CcOiWH-q6bfZ
+```
+
+Then fetch the asset:
+
+```bash
+python scripts/fetch_scene4.py
+```
+
+`scripts/start_scene4_live_blender.sh` runs the same fetch automatically when
+`scene4/scene4/main.usd` is missing. Set `ARDY_SCENE4_FETCH=0` to disable that behavior.
+
+On first run after the asset is present, the launcher creates `outputs/live_api/scene4_textured.usda`,
+a lightweight wrapper layer that converts scene4's custom texture inputs into Blender-readable
+`UsdPreviewSurface` material networks.
+
+The launcher uses Blender's Vulkan backend, selects the first NVIDIA GPU reported by Blender, and
+disables device fallback so a failed selection cannot silently use integrated graphics. Override the
+selection with `ARDY_BLENDER_GPU_DEVICE`; list valid devices with:
+
+```bash
+~/Projects/blender/blender --gpu-backend vulkan --gpu-device help
+```
+
+The live server's `/health` response reports the active GPU backend, vendor, and renderer.
+It also reports the active 3D viewport transform. The scene4 launcher restores the preferred
+Layout viewport captured for development and creates the active render camera from that view.
+Live motion prompts retain this camera by default; pass `--auto-camera` to replace it with automatic
+motion framing for a specific prompt.
+
+Maintainers can create and upload a new versioned asset pack with:
+
+```bash
+python scripts/package_scene4.py --version 2026-07-29 --reuse-existing --upload
+git add assets/scene4.json
+```
+
+The generated archive is stored under `.cache/assets/` locally and is not committed. Commit only the
+updated manifest after upload.
+
+Equivalent manual startup:
+
+```bash
+~/Projects/blender/blender \
+  --gpu-backend vulkan \
+  --gpu-device 1 \
+  --gpu-device-no-fallback \
+  --python scripts/blender_live_server.py -- \
+  --port 9876 \
+  --width 640 \
+  --height 360 \
+  --usd outputs/live_api/scene4_textured.usda \
+  --light-intensity-scale 0.0001 \
+  --max-light-energy 600 \
+  --exposure 0.0 \
+  --gamma 1.0 \
+  --view-transform AgX \
+  --world-color 0.02 0.02 0.02 \
+  --viewport-shading RENDERED \
+  --use-scene-lights \
+  --use-scene-world \
+  --viewport-location -0.0206932481 -0.0460254699 0.0006694308 \
+  --viewport-rotation 0.8370923996 0.5182799101 0.0921778455 0.1488799900 \
+  --viewport-distance 5.1317672729 \
+  --viewport-lens 50.0 \
+  --viewport-perspective PERSP \
+  --create-default-camera \
+  --create-forehead-camera \
+  --avatar-position 0.5 0.25 0.0 \
+  --avatar-heading 0.0 \
+  --show-default-avatar
+```
+
+`place --position X Y Z` uses Blender coordinates. `X/Y` become ARDY's ground-plane root
+translation; `Z` is applied as a visual vertical offset in Blender. `--heading 0` faces Blender
+`+Y`. Add `--loop` to a prompt only when you want the segment to loop; without it, playback stops
+on the final frame so the next prompt can resume from that end state.
+
+Waypoints use the same Blender ground-plane coordinates as placement. You can still pass explicit
+targets on each prompt: `--waypoint FRAME X Y` sets a root target, `--waypoint X Y` auto-spaces
+targets across the requested duration, and `--waypoint-time SECONDS X Y` targets a timestamp.
+
+For scene layout work, you can also place waypoints from Blender's 3D cursor:
+
+```bash
+# In Blender: select the 3D Cursor tool, then left-click a floor point.
+python scripts/live_session_client.py add-waypoint
+
+# Repeat cursor placement and add-waypoint for each floor point. The server adds WP<N>
+# markers and a connecting route curve in the live Blender scene.
+python scripts/live_session_client.py waypoints
+
+# If no explicit --waypoint values are supplied, prompt generation uses the stored Blender markers.
+python scripts/live_session_client.py prompt \
+  "Walk naturally along the marked route." \
+  --duration 6 \
+  --cfg-weight 2.0 2.0 \
+  --show-root-path \
+  --output cursor_waypoint_walk
+```
+
+Typed marker placement uses the same waypoint store:
+
+```bash
+python scripts/live_session_client.py add-waypoint --position 0.6 0.3 --frame 40
+python scripts/live_session_client.py add-waypoint --position 0.2 0.1 --frame 80
+python scripts/live_session_client.py add-waypoint --position 0.0 0.0 --frame 119
+python scripts/live_session_client.py remove-last-waypoint
+python scripts/live_session_client.py clear-waypoints
+```
+
+Stored waypoint marker positions keep Blender `(X, Y, Z)` for display, but ARDY uses only the
+ground-plane `(X, Y)` values as root constraints. Add `--no-stored-waypoints` to a prompt to ignore
+the live Blender marker list. The live API response includes the parsed `waypoints`, the
+`waypoint_source`, and `waypoint_errors` for the generated root positions. Raw HTTP clients can send
+the same data as JSON:
+
+```json
+{
+  "prompt": "Walk naturally along the marked route.",
+  "duration": 6,
+  "cfg_weight": [2.0, 2.0],
+  "waypoints": [
+    {"frame": 40, "position": [0.6, 0.3]},
+    {"time": 4.0, "position": [0.2, 0.1]},
+    [119, 0.0, 0.0]
+  ]
+}
+```
+
+Optional MP4 export uses the same live Blender process:
+
+```bash
+python scripts/live_session_client.py render-mp4 outputs/live_api/current_take.mp4
+```
+
+Check local tools, CUDA, and Hugging Face access with:
+
+```bash
+curl http://127.0.0.1:8766/diagnostics
+```
+
+The same Hugging Face token requirements from setup apply: prompt generation needs access to the
+gated Meta Llama text encoder unless you run a compatible text-encoder service and start the API
+with `--text-encoder-mode api --text-encoder-url ...`.
+
+Equivalent raw HTTP request:
+
+```bash
+curl -X POST http://127.0.0.1:8765/generate \
+  -H 'Content-Type: application/json' \
+  -d '{"prompt":"A person jumps backwards.","duration":4,"render":true}'
+```
+
 ---
 
 ## Related Humanoid Work at NVIDIA
